@@ -118,13 +118,7 @@ pub fn verify_completion_opencode(session_id: &str, working_dir: &str) -> Result
         ])
         .current_dir(working_dir)
         .env("PATH", crate::services::claude::enhanced_path_for_bin(&opencode_bin))
-        // Block `question` / `plan_exit` — both wait on a user reply via
-        // opencode's `question.ask` Deferred and would hang the verify fork.
-        // The verify prompt itself says "Do NOT call any tools", but the
-        // `plan` agent's plan_exit is auto-called when planning concludes, so
-        // the deny rule is a belt-and-braces safeguard. See the matching
-        // comment in `build_opencode_command` / `spawn_opencode_serve`.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
+        .env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -196,9 +190,49 @@ static OPENCODE_AVAILABLE: OnceLock<bool> = OnceLock::new();
 fn check_opencode_available() -> bool {
     opencode_debug("[check_opencode_available] START");
 
-    if let Some(path) = resolve_opencode_path() {
-        opencode_debug(&format!("[check_opencode_available] found: {}", path));
-        return true;
+    #[cfg(windows)]
+    {
+        opencode_debug("[check_opencode_available] disabled on Windows");
+        return false;
+    }
+
+    if let Ok(val) = std::env::var("COKAC_OPENCODE_PATH") {
+        if !val.is_empty() && std::path::Path::new(&val).exists() {
+            opencode_debug(&format!("[check_opencode_available] found via COKAC_OPENCODE_PATH={}", val));
+            return true;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(output) = Command::new("which").arg("opencode").output() {
+            if output.status.success() {
+                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !p.is_empty() && std::path::Path::new(&p).exists() {
+                    opencode_debug(&format!("[check_opencode_available] found via which: {}", p));
+                    return true;
+                }
+            }
+        }
+        if let Ok(output) = Command::new("bash").args(["-lc", "which opencode"]).output() {
+            if output.status.success() {
+                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !p.is_empty() && std::path::Path::new(&p).exists() {
+                    opencode_debug(&format!("[check_opencode_available] found via bash -lc which: {}", p));
+                    return true;
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(output) = Command::new("where").arg("opencode").output() {
+            if output.status.success() {
+                opencode_debug("[check_opencode_available] found via where");
+                return true;
+            }
+        }
     }
 
     opencode_debug("[check_opencode_available] NOT FOUND");
@@ -271,13 +305,8 @@ fn resolve_opencode_path() -> Option<String> {
     opencode_debug("[resolve_opencode_path] START");
 
     if let Ok(val) = std::env::var("COKAC_OPENCODE_PATH") {
-        if !val.is_empty() && opencode_path_is_runnable(&val) {
+        if !val.is_empty() && std::path::Path::new(&val).exists() {
             opencode_debug(&format!("[resolve_opencode_path] COKAC_OPENCODE_PATH={}", val));
-            #[cfg(windows)]
-            if let Some(path) = opencode_native_exe_for_wrapper(&val) {
-                opencode_debug(&format!("[resolve_opencode_path] env wrapper -> native exe {}", path));
-                return Some(path);
-            }
             return Some(val);
         }
     }
@@ -287,7 +316,7 @@ fn resolve_opencode_path() -> Option<String> {
         if let Ok(output) = Command::new("which").arg("opencode").output() {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() && opencode_path_is_runnable(&p) {
+                if !p.is_empty() && std::path::Path::new(&p).exists() {
                     opencode_debug(&format!("[resolve_opencode_path] which → {}", p));
                     return Some(p);
                 }
@@ -296,7 +325,7 @@ fn resolve_opencode_path() -> Option<String> {
         if let Ok(output) = Command::new("bash").args(["-lc", "which opencode"]).output() {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() && opencode_path_is_runnable(&p) {
+                if !p.is_empty() && std::path::Path::new(&p).exists() {
                     opencode_debug(&format!("[resolve_opencode_path] bash -lc which → {}", p));
                     return Some(p);
                 }
@@ -306,52 +335,12 @@ fn resolve_opencode_path() -> Option<String> {
 
     #[cfg(windows)]
     {
-        // Prefer native executables over npm .cmd wrappers. Rust can run
-        // .cmd/.bat files, but doing so goes through cmd.exe and adds a batch
-        // argument-escaping layer for arbitrary user prompts.
-        if let Some(path) = crate::services::claude::search_path_wide("opencode", Some(".exe")) {
-            opencode_debug(&format!("[resolve_opencode_path] SearchPathW .exe -> {}", path));
-            return Some(path);
-        }
-        // npm also installs an extensionless POSIX shell script named
-        // `opencode`; CreateProcess cannot run it. The .cmd wrapper normally
-        // sits next to node_modules/opencode-ai/bin/opencode.exe, which is the
-        // safer target when present.
-        if let Some(path) = crate::services::claude::search_path_wide("opencode", Some(".cmd")) {
-            if let Some(native) = opencode_native_exe_for_wrapper(&path) {
-                opencode_debug(&format!("[resolve_opencode_path] SearchPathW .cmd -> native exe {}", native));
-                return Some(native);
-            }
-            opencode_debug(&format!("[resolve_opencode_path] SearchPathW .cmd -> {}", path));
-            return Some(path);
-        }
-        if let Ok(output) = Command::new("where.exe").arg("opencode").output() {
+        if let Ok(output) = Command::new("where").arg("opencode").output() {
             if output.status.success() {
-                let decoded = crate::services::claude::decode_windows_output(&output.stdout);
-                for p in decoded.lines().map(str::trim).filter(|p| !p.is_empty()) {
-                    if opencode_path_is_runnable(p) {
-                        if let Some(native) = opencode_native_exe_for_wrapper(p) {
-                            opencode_debug(&format!("[resolve_opencode_path] where -> native exe {}", native));
-                            return Some(native);
-                        }
-                        opencode_debug(&format!("[resolve_opencode_path] where -> {}", p));
-                        return Some(p.to_string());
-                    }
-                }
-            }
-        }
-        if let Ok(output) = Command::new("cmd").args(["/c", "npm root -g"]).output() {
-            if output.status.success() {
-                let npm_root = crate::services::claude::decode_windows_output(&output.stdout)
-                    .trim()
-                    .to_string();
-                let p = std::path::Path::new(&npm_root)
-                    .join("opencode-ai")
-                    .join("bin")
-                    .join("opencode.exe");
-                if p.exists() {
-                    let p = p.display().to_string();
-                    opencode_debug(&format!("[resolve_opencode_path] npm root fallback -> {}", p));
+                let p = String::from_utf8_lossy(&output.stdout).lines().next()
+                    .unwrap_or("").to_string();
+                if !p.is_empty() && std::path::Path::new(&p).exists() {
+                    opencode_debug(&format!("[resolve_opencode_path] where → {}", p));
                     return Some(p);
                 }
             }
@@ -360,57 +349,6 @@ fn resolve_opencode_path() -> Option<String> {
 
     opencode_debug("[resolve_opencode_path] NOT FOUND, will use 'opencode'");
     None
-}
-
-fn opencode_path_is_runnable(path: &str) -> bool {
-    let p = std::path::Path::new(path);
-    if !p.is_file() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        matches!(ext.as_str(), "cmd" | "exe" | "bat" | "com")
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        p.metadata()
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-            .unwrap_or(false)
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        true
-    }
-}
-
-#[cfg(windows)]
-fn opencode_native_exe_for_wrapper(path: &str) -> Option<String> {
-    let wrapper = std::path::Path::new(path);
-    let ext = wrapper
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext != "cmd" && ext != "bat" {
-        return None;
-    }
-    let parent = wrapper.parent()?;
-    let p = parent
-        .join("node_modules")
-        .join("opencode-ai")
-        .join("bin")
-        .join("opencode.exe");
-    if p.exists() {
-        Some(p.display().to_string())
-    } else {
-        None
-    }
 }
 
 // ============================================================
@@ -806,17 +744,10 @@ fn build_opencode_command(
     let mut cmd = Command::new(&opencode_bin);
     cmd.args(&args)
         .current_dir(working_dir)
-        // `question` and `plan_exit` are the only opencode tools that block on
-        // a user reply through opencode's `question.ask` Deferred. cokacdir's
-        // Telegram flow has no handler that posts answers back, so an AI call
-        // to either tool would hang the session forever. Deny them explicitly
-        // while keeping every other tool allowed. Permission evaluation uses
-        // `findLast` so the trailing keys override the leading `*` rule.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
+        .env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::services::claude::detach_into_own_pgroup(&mut cmd);
 
     (cmd, sp_path)
 }
@@ -834,19 +765,8 @@ fn parse_text_event(json: &Value) -> Option<String> {
 }
 
 /// Normalize opencode's lowercase tool names to PascalCase (system standard).
-///
-/// Verified against opencode v1.15.5 `packages/opencode/src/tool/*.ts` —
-/// each `Tool.define("<id>", …)` first-arg is the wire-level tool name we
-/// receive on `message.part.updated` events with `part.type == "tool"`.
-///
-/// The first block lists every tool ID opencode 1.15.5 actually emits; the
-/// second block is legacy aliases (older opencode versions / Claude-Code
-/// alternate names) kept for backward compatibility — opencode 1.15.5 does
-/// not emit them, so they are dead in the current version but harmless and
-/// useful when running against older binaries.
 fn normalize_tool_name(name: &str) -> String {
     match name {
-        // ── opencode 1.15.5 tool IDs (verified against tool registry) ──
         "bash" => "Bash",
         "read" => "Read",
         "write" => "Write",
@@ -855,98 +775,40 @@ fn normalize_tool_name(name: &str) -> String {
         "grep" => "Grep",
         "webfetch" => "WebFetch",
         "websearch" => "WebSearch",
-        "task" => "Task",
-        "task_status" => "TaskStatus",
-        "skill" => "Skill",
-        "todowrite" => "TodoWrite",
-        "question" => "Question",
-        "plan_exit" => "PlanExit",
-        "lsp" => "Lsp",
-        "repo_clone" => "RepoClone",
-        "repo_overview" => "RepoOverview",
-        "invalid" => "Invalid",
-        "apply_patch" => "Edit",
-        // ── Legacy aliases (older opencode / Claude-Code parity) ──
         "notebookedit" => "NotebookEdit",
         "list" => "Glob",
+        "task" => "Task",
         "taskoutput" => "TaskOutput",
         "taskstop" => "TaskStop",
         "taskcreate" => "TaskCreate",
         "taskupdate" => "TaskUpdate",
         "taskget" => "TaskGet",
         "tasklist" => "TaskList",
+        "skill" => "Skill",
+        "todowrite" => "TodoWrite",
         "todoread" => "TodoRead",
         "askuserquestion" => "AskUserQuestion",
         "enterplanmode" => "EnterPlanMode",
         "exitplanmode" => "ExitPlanMode",
         "codesearch" => "Grep",
+        "apply_patch" => "Edit",
         _ => name,
     }.to_string()
 }
 
 /// Normalize OpenCode tool input field names to Claude-compatible names.
-///
-/// opencode 1.15.5 uses **camelCase** for tool parameters (e.g. `filePath`,
-/// `oldString`, `replaceAll`, `include`), while cokacdir's UI renderer in
-/// `ui/ai_screen.rs` looks up **snake_case** keys (`file_path`, `old_string`,
-/// `replace_all`, `glob`). Without this normalization the UI would display
-/// empty file paths and missing parameters for `write`, `edit`, and `grep`
-/// tool calls coming from opencode.
-///
-/// Per-tool key map (opencode wire key → cokacdir canonical key):
-/// - `read`  : filePath → file_path
-/// - `write` : filePath → file_path
-/// - `edit`  : filePath → file_path, oldString → old_string, newString → new_string, replaceAll → replace_all
-/// - `grep`  : include → glob
-/// - `apply_patch` : synth file_path from `*** Add/Update/Delete File:` line
-/// - `skill` : name → skill
-///
-/// Other opencode tools (`bash`, `glob`, `webfetch`, `websearch`, `task`,
-/// `task_status`, `lsp`, `repo_clone`, `repo_overview`, `question`,
-/// `plan_exit`, `invalid`, `todowrite`) already use keys the UI renderer
-/// accepts as-is, so they need no normalization.
 fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
     let Some(obj) = input.as_object() else { return input.clone() };
     let mut out = obj.clone();
 
-    // Rename a single camelCase key to its snake_case canonical form, only if
-    // the snake_case key is not already present (so we never clobber an
-    // already-correct value emitted by a hypothetical future opencode that
-    // adopts snake_case).
-    fn rename(out: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
-        if out.contains_key(from) && !out.contains_key(to) {
-            if let Some(v) = out.remove(from) {
-                out.insert(to.to_string(), v);
-            }
-        }
-    }
-
     match tool {
         "read" => {
-            rename(&mut out, "filePath", "file_path");
-        }
-        "write" => {
-            rename(&mut out, "filePath", "file_path");
-        }
-        "edit" => {
-            rename(&mut out, "filePath", "file_path");
-            rename(&mut out, "oldString", "old_string");
-            rename(&mut out, "newString", "new_string");
-            rename(&mut out, "replaceAll", "replace_all");
-        }
-        "grep" => {
-            // opencode's grep tool uses `include` (file-glob filter) while
-            // cokacdir's UI displays it under the canonical `glob` key — same
-            // semantic, different name.
-            rename(&mut out, "include", "glob");
-        }
-        "lsp" => {
-            // No "Lsp" handler in ui/ai_screen.rs today — display falls through
-            // to the generic key-listing branch — but normalize here so the
-            // listed keys read consistently with the rest of the system
-            // (snake_case), and so a future Lsp-specific UI handler can read
-            // `file_path` like the other file-touching tools.
-            rename(&mut out, "filePath", "file_path");
+            // filePath → file_path
+            if out.contains_key("filePath") && !out.contains_key("file_path") {
+                if let Some(v) = out.remove("filePath") {
+                    out.insert("file_path".to_string(), v);
+                }
+            }
         }
         "apply_patch" => {
             // Extract file_path from patchText for display
@@ -963,7 +825,12 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
             }
         }
         "skill" => {
-            rename(&mut out, "name", "skill");
+            // name → skill
+            if out.contains_key("name") && !out.contains_key("skill") {
+                if let Some(v) = out.remove("name") {
+                    out.insert("skill".to_string(), v);
+                }
+            }
         }
         _ => {}
     }
@@ -1059,15 +926,6 @@ pub fn execute_command(
     opencode_debug(&format!("[execute_command] START prompt_len={} session_id={:?} working_dir={} model={:?}",
         prompt.len(), session_id, working_dir, model));
     opencode_debug(&format!("[execute_command] prompt_preview={:?}", log_preview(prompt, 200)));
-
-    if let Some(sid) = session_id {
-        if !crate::services::process::is_valid_session_id(sid) {
-            return ClaudeResponse {
-                success: false, response: None, session_id: None,
-                error: Some(format!("Invalid session_id format: {}", sid)),
-            };
-        }
-    }
 
     let (mut cmd, _sp_path) = build_opencode_command(
         session_id, working_dir, None, model,
@@ -1338,11 +1196,6 @@ pub fn execute_command_streaming(
     model: Option<&str>,
     no_session_persistence: bool,
 ) -> Result<(), String> {
-    if let Some(sid) = session_id {
-        if !crate::services::process::is_valid_session_id(sid) {
-            return Err(format!("Invalid session_id format: {}", sid));
-        }
-    }
     let force_legacy = std::env::var("COKACDIR_OPENCODE_LEGACY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -1434,7 +1287,6 @@ fn execute_command_streaming_legacy(
     opencode_debug(&format!("[stream] effective_prompt_len={} delivery={}", prompt.len(),
         if use_positional { "positional" } else { "stdin" }));
 
-    crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
     opencode_debug("[stream] spawning process...");
     let mut child = cmd.spawn().map_err(|e| {
         opencode_debug(&format!("[stream] spawn FAILED: {}", e));
@@ -1442,13 +1294,9 @@ fn execute_command_streaming_legacy(
     })?;
     opencode_debug(&format!("[stream] spawned PID={}", child.id()));
 
-    // Store PID for cancel. Recover from a poisoned mutex (a prior holder
-    // panicked) instead of silently dropping the PID — without it stored,
-    // /stop cannot signal this child.
+    // Store PID for cancel
     if let Some(ref token) = cancel_token {
-        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(child.id());
-        drop(guard);
+        *token.child_pid.lock().unwrap() = Some(child.id());
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             opencode_debug("[stream] cancelled before stdin write, killing");
             kill_child_tree(&mut child);
@@ -1471,14 +1319,6 @@ fn execute_command_streaming_legacy(
     } else {
         opencode_debug("[stream] WARN: no stdin handle");
     }
-
-    // Drain stderr in a background thread to prevent deadlock: if the child
-    // writes more than the OS pipe buffer (~64KB) to stderr while we're
-    // blocked reading stdout, the child's stderr write blocks and the whole
-    // pipeline hangs. Mirrors the pattern in codex.rs / gemini.rs.
-    let stderr_thread = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
-    });
 
     // Read stdout line by line
     let stdout = child.stdout.take().ok_or_else(|| {
@@ -1700,9 +1540,9 @@ fn execute_command_streaming_legacy(
         format!("Process error: {}", e)
     })?;
 
-    // Collect stderr drained by the background thread.
-    let stderr_msg = stderr_thread
-        .and_then(|h| h.join().ok())
+    // Always capture stderr for diagnostics
+    let stderr_msg = child.stderr.take()
+        .and_then(|s| std::io::read_to_string(s).ok())
         .unwrap_or_default();
     if !stderr_msg.is_empty() {
         opencode_debug(&format!("[stream] STDERR: {}", log_preview(&stderr_msg, 500)));
@@ -1827,6 +1667,9 @@ impl ServeChild {
     fn new(child: tokio::process::Child) -> Self {
         Self { child: Some(child) }
     }
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
+    }
     async fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
             let pid_opt = child.id();
@@ -1855,9 +1698,10 @@ impl Drop for ServeChild {
     }
 }
 
-/// Kill the whole serve process family led by `pid`. Unix uses a process
-/// group kill; Windows uses taskkill's tree mode. Ignores errors: the worst
-/// case is that `start_kill` below still kills the direct child.
+/// Send SIGKILL to the whole process group led by `pid`. No-op on platforms
+/// other than Unix. Ignores errors: the worst case is that we left a group
+/// running, which tokio's kill_on_drop + direct child kill should cover on
+/// its own.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn kill_serve_process_group(pid_opt: Option<u32>) {
@@ -1871,18 +1715,9 @@ fn kill_serve_process_group(pid_opt: Option<u32>) {
     }
 }
 
-#[cfg(windows)]
-fn kill_serve_process_group(pid_opt: Option<u32>) {
-    if let Some(pid) = pid_opt {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
-}
-
-#[cfg(all(not(unix), not(windows)))]
+#[cfg(not(unix))]
 fn kill_serve_process_group(_pid_opt: Option<u32>) {
-    // Other non-Unix platforms: fall back to the direct child kill only.
+    // Non-unix platforms: fall back to the direct child kill only.
 }
 
 /// Async-side entry point for the SSE adapter. Orchestrates the whole turn.
@@ -1927,13 +1762,9 @@ async fn execute_command_streaming_serve(
     }
 
     // ---- 3. Spawn opencode serve and wait for readiness ----
-    let (mut serve_child, base_url) = match spawn_opencode_serve(working_dir, cancel_token.as_ref()).await {
+    let (mut serve_child, base_url) = match spawn_opencode_serve(working_dir).await {
         Ok(pair) => pair,
         Err(e) => {
-            if serve_cancel_hit(cancel_token.as_ref()) {
-                opencode_debug(&format!("[serve] spawn aborted after cancel: {}", e));
-                return Ok(());
-            }
             opencode_debug(&format!("[serve] spawn failed: {}", e));
             let _ = sender.send(StreamMessage::Error {
                 message: format!("Failed to start opencode serve: {}", e),
@@ -1945,6 +1776,15 @@ async fn execute_command_streaming_serve(
         }
     };
     opencode_debug(&format!("[serve] ready at {}", base_url));
+
+    // Register PID for external cancel
+    if let Some(ref token) = cancel_token {
+        if let Some(pid) = serve_child.id() {
+            if let Ok(mut guard) = token.child_pid.lock() {
+                *guard = Some(pid);
+            }
+        }
+    }
 
     // ---- 4. Build HTTP clients ----
     //
@@ -2037,20 +1877,7 @@ async fn execute_command_streaming_serve(
     // consumer has connected and we would miss them entirely. To close that
     // race, the HTTP GET /event call happens on this (main) task; only the
     // chunk-reading loop is then handed off to a spawned task.
-    // Use /global/event, not /event. The per-instance /event endpoint only
-    // emits BusEvents (message.part.delta, session.status, session.idle, …)
-    // and silently omits SyncEvents like message.part.updated and
-    // message.updated. Without message.part.updated, the consumer below
-    // cannot learn that an in-flight part has type "text" (versus
-    // "reasoning"), so every delta is dropped by the part_types guard and
-    // the turn ends with an empty result → "(No response)". /global/event
-    // wraps each event in a {directory, project, payload} envelope and
-    // forwards SyncEvents alongside BusEvents (and a redundant payload.type
-    // == "sync" copy that we skip during unwrap). Verified live against
-    // opencode 1.15.0: with /event the SSE stream emitted 0
-    // message.part.updated frames; with /global/event the same turn emitted
-    // them in the order the legacy consumer expects.
-    let sse_url = format!("{}/global/event", base_url);
+    let sse_url = format!("{}/event", base_url);
     opencode_debug(&format!("[serve] connecting SSE: {}", sse_url));
     let sse_resp = match sse_client.get(&sse_url).send().await {
         Ok(r) if r.status().is_success() => r,
@@ -2217,7 +2044,6 @@ async fn execute_command_streaming_serve(
 /// the child handle along with the parsed base URL.
 async fn spawn_opencode_serve(
     working_dir: &str,
-    cancel_token: Option<&Arc<CancelToken>>,
 ) -> Result<(ServeChild, String), String> {
     use tokio::io::AsyncBufReadExt;
     use tokio::io::BufReader as TokioBufReader;
@@ -2242,16 +2068,7 @@ async fn spawn_opencode_serve(
         // JSON string like `"allow"` silently no-ops. `{"*":"allow"}` becomes
         // the ruleset rule `{permission:"*", pattern:"*", action:"allow"}`
         // which matches every permission check including `external_directory`.
-        //
-        // `question` and `plan_exit` are the only tools that block on a user
-        // reply through opencode's `question.ask` Deferred (see
-        // packages/opencode/src/tool/question.ts and plan.ts). cokacdir's
-        // Telegram flow has no handler that posts answers back to opencode,
-        // so an AI call to either tool would hang the session forever. Deny
-        // them explicitly while keeping every other tool allowed. Permission
-        // evaluation uses `findLast` (see permission/evaluate.ts), so the
-        // trailing `question`/`plan_exit` rules override the leading `*`.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
+        .env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2269,29 +2086,11 @@ async fn spawn_opencode_serve(
     {
         cmd.process_group(0);
     }
-    crate::services::claude::attach_cancel_cgroup_tokio(&mut cmd, cancel_token);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {}", bin, e))?;
     opencode_debug(&format!("[serve.spawn] spawned PID={:?}", child.id()));
-
-    // Register PID immediately after spawn so /stop can kill the serve
-    // process even while we are still waiting for the readiness line.
-    // Recover from a poisoned mutex instead of silently dropping the PID.
-    if let Some(token) = cancel_token {
-        if let Some(pid) = child.id() {
-            let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(pid);
-        }
-        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            opencode_debug("[serve.spawn] cancelled after PID registration");
-            token.cancel_now();
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-            return Err("cancelled before opencode serve became ready".to_string());
-        }
-    }
 
     // Take stdout/stderr readers. The readiness line can appear on either one
     // depending on how opencode decided to log in this build — probe both.
@@ -2505,13 +2304,11 @@ async fn post_prompt_async(
     Ok(())
 }
 
-/// Consume an already-connected `GET /global/event` response as a stream of
-/// SSE frames, translating each into zero or more `StreamMessage` variants
-/// that belong to the parent session. Each frame's outer JSON wraps the real
-/// event in a `payload` field (see the unwrap in the body); `handle_sse_event`
-/// itself operates on the unwrapped event. Text parts feed both the live UI
-/// stream (via `StreamMessage::Text`) and a shared accumulator used for the
-/// final `Done.result`.
+/// Consume an already-connected `GET /event` response as a stream of SSE
+/// frames, translating each into zero or more `StreamMessage` variants that
+/// belong to the parent session. Text parts feed both the live UI stream
+/// (via `StreamMessage::Text`) and a shared accumulator used for the final
+/// `Done.result`.
 async fn consume_sse_chunks(
     mut resp: reqwest::Response,
     parent_sid: String,
@@ -2584,7 +2381,7 @@ async fn consume_sse_chunks(
             if payload.is_empty() {
                 continue;
             }
-            let raw_json: Value = match serde_json::from_str(&payload) {
+            let json: Value = match serde_json::from_str(&payload) {
                 Ok(v) => v,
                 Err(e) => {
                     opencode_debug(&format!(
@@ -2594,25 +2391,6 @@ async fn consume_sse_chunks(
                     ));
                     continue;
                 }
-            };
-            // /global/event wraps every event in
-            //   { "directory": "...", "project": "...", "payload": {...} }
-            // (server.connected / server.heartbeat omit the directory/project
-            // keys but still wrap as { "payload": {...} }). When the inner
-            // payload itself has `type == "sync"`, it is a versioned mirror
-            // of an event that was already published unwrapped through the
-            // same stream — `handle_sse_event` would see the unwrapped copy
-            // moments earlier, so we skip the sync envelope here to avoid
-            // double-handling.
-            let json: Value = match raw_json.get("payload") {
-                Some(inner) => {
-                    let inner_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if inner_type == "sync" {
-                        continue;
-                    }
-                    inner.clone()
-                }
-                None => raw_json,
             };
             handle_sse_event(
                 &json,

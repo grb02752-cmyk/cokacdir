@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyModifiers};
+use rand::Rng;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -6,24 +7,34 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
-use rand::Rng;
-use unicode_width::UnicodeWidthChar;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
+use unicode_width::UnicodeWidthChar;
 
-use crate::utils::format::safe_truncate;
+use crate::config::state_root_dir;
 use crate::keybindings::{AIScreenAction, Keybindings};
+use crate::utils::format::safe_truncate;
+
+const WORKER_FINISHED_WITHOUT_RESPONSE_MESSAGE: &str =
+    "Request finished, but no final response was received.";
+
+fn ai_state_root_subdir(name: &str) -> Option<PathBuf> {
+    state_root_dir().map(|root| root.join(name))
+}
 
 /// Debug logging helper (active when /debug toggled ON or COKACDIR_DEBUG=1)
 fn debug_log(msg: &str) {
     use std::sync::atomic::Ordering;
-    if !crate::services::claude::DEBUG_ENABLED.load(Ordering::Relaxed) { return; }
-    if let Some(home) = dirs::home_dir() {
-        let debug_dir = home.join(".cokacdir").join("debug");
+    if !crate::services::claude::DEBUG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(debug_dir) = ai_state_root_subdir("debug") {
         let _ = std::fs::create_dir_all(&debug_dir);
         let log_path = debug_dir.join("ai_screen.log");
         if let Ok(mut file) = OpenOptions::new()
@@ -39,7 +50,7 @@ fn debug_log(msg: &str) {
 }
 
 use super::theme::Theme;
-use crate::services::claude::{self, CancelToken, StreamMessage};
+use crate::services::claude::{self, StreamMessage};
 use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 /// Sanitize user input to prevent prompt injection attacks
@@ -72,8 +83,16 @@ pub fn sanitize_user_input(input: &str) -> String {
             // Also handle case variations
             let pattern_lower = pattern.to_lowercase();
             let pattern_upper = pattern.to_uppercase();
-            let pattern_title: String = pattern.chars().enumerate()
-                .map(|(i, c)| if i == 0 { c.to_uppercase().next().unwrap_or(c) } else { c })
+            let pattern_title: String = pattern
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 0 {
+                        c.to_uppercase().next().unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
                 .collect();
             sanitized = sanitized.replace(&pattern_lower, "[filtered]");
             sanitized = sanitized.replace(&pattern_upper, "[filtered]");
@@ -105,7 +124,7 @@ fn normalize_empty_lines(text: &str) -> String {
 
         if is_empty {
             if !prev_was_empty {
-                result_lines.push("");  // Add single empty line
+                result_lines.push(""); // Add single empty line
             }
             prev_was_empty = true;
         } else {
@@ -128,11 +147,8 @@ fn format_tool_use(name: &str, input: &str) -> String {
     match name {
         "Bash" => {
             // Show: command, description (optional)
-            let cmd = json.get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let desc = json.get("description")
-                .and_then(|v| v.as_str());
+            let cmd = json.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = json.get("description").and_then(|v| v.as_str());
             match desc {
                 Some(d) => format!("$ {}\n  ({})", cmd, d),
                 None => format!("$ {}", cmd),
@@ -140,32 +156,23 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "Read" => {
             // Show: file_path
-            let path = json.get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = json.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             format!("file: {}", path)
         }
         "Write" => {
             // Show: file_path only (exclude content - can be large)
-            let path = json.get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = json.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             format!("file: {}", path)
         }
         "Edit" => {
             // Show: file_path only (exclude old_string, new_string - can be large)
-            let path = json.get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = json.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             format!("file: {}", path)
         }
         "Glob" => {
             // Show: pattern, path (optional)
-            let pattern = json.get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = json.get("path")
-                .and_then(|v| v.as_str());
+            let pattern = json.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = json.get("path").and_then(|v| v.as_str());
             match path {
                 Some(p) => format!("pattern: {}  path: {}", pattern, p),
                 None => format!("pattern: {}", pattern),
@@ -173,13 +180,9 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "Grep" => {
             // Show: pattern, path (optional), glob (optional)
-            let pattern = json.get("pattern")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = json.get("path")
-                .and_then(|v| v.as_str());
-            let glob = json.get("glob")
-                .and_then(|v| v.as_str());
+            let pattern = json.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = json.get("path").and_then(|v| v.as_str());
+            let glob = json.get("glob").and_then(|v| v.as_str());
             let mut result = format!("pattern: {}", pattern);
             if let Some(p) = path {
                 result.push_str(&format!("  path: {}", p));
@@ -191,35 +194,33 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "Task" => {
             // Show: description, subagent_type (exclude prompt - can be large)
-            let desc = json.get("description")
+            let desc = json
+                .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let agent = json.get("subagent_type")
+            let agent = json
+                .get("subagent_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             format!("{} [{}]", desc, agent)
         }
         "WebFetch" => {
             // Show: url (exclude prompt)
-            let url = json.get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("url: {}", url)
         }
         "WebSearch" => {
             // Show: query
-            let query = json.get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let query = json.get("query").and_then(|v| v.as_str()).unwrap_or("");
             format!("query: {}", query)
         }
         "NotebookEdit" => {
             // Show: notebook_path, cell_type (exclude new_source - can be large)
-            let path = json.get("notebook_path")
+            let path = json
+                .get("notebook_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let cell_type = json.get("cell_type")
-                .and_then(|v| v.as_str());
+            let cell_type = json.get("cell_type").and_then(|v| v.as_str());
             match cell_type {
                 Some(ct) => format!("notebook: {}  cell: {}", path, ct),
                 None => format!("notebook: {}", path),
@@ -229,9 +230,7 @@ fn format_tool_use(name: &str, input: &str) -> String {
             // Show: first question only
             if let Some(questions) = json.get("questions").and_then(|v| v.as_array()) {
                 if let Some(first) = questions.first() {
-                    let q = first.get("question")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let q = first.get("question").and_then(|v| v.as_str()).unwrap_or("");
                     return format!("Q: {}", q);
                 }
             }
@@ -239,10 +238,8 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "TaskCreate" | "TaskUpdate" | "TaskGet" | "TaskList" => {
             // Show: subject or taskId
-            let subject = json.get("subject")
-                .and_then(|v| v.as_str());
-            let task_id = json.get("taskId")
-                .and_then(|v| v.as_str());
+            let subject = json.get("subject").and_then(|v| v.as_str());
+            let task_id = json.get("taskId").and_then(|v| v.as_str());
             match (subject, task_id) {
                 (Some(s), _) => format!("subject: {}", s),
                 (_, Some(id)) => format!("taskId: {}", id),
@@ -251,11 +248,8 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "Skill" => {
             // Show: skill name, args
-            let skill = json.get("skill")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args = json.get("args")
-                .and_then(|v| v.as_str());
+            let skill = json.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            let args = json.get("args").and_then(|v| v.as_str());
             match args {
                 Some(a) => format!("/{} {}", skill, a),
                 None => format!("/{}", skill),
@@ -267,9 +261,7 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "TaskOutput" | "TaskStop" => {
             // Show: task_id
-            let task_id = json.get("task_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let task_id = json.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             format!("task_id: {}", task_id)
         }
         "TodoWrite" => {
@@ -277,12 +269,8 @@ fn format_tool_use(name: &str, input: &str) -> String {
             if let Some(todos) = json.get("todos").and_then(|v| v.as_array()) {
                 let count = todos.len();
                 if let Some(first) = todos.first() {
-                    let content = first.get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let status = first.get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = first.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = first.get("status").and_then(|v| v.as_str()).unwrap_or("");
                     if count > 1 {
                         return format!("[{}] {} (+{} more)", status, content, count - 1);
                     } else {
@@ -294,14 +282,13 @@ fn format_tool_use(name: &str, input: &str) -> String {
         }
         "ToolSearch" => {
             // Show: query
-            let query = json.get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let query = json.get("query").and_then(|v| v.as_str()).unwrap_or("");
             format!("search: {}", query)
         }
         _ => {
             // Unknown tool - show keys only (no values to avoid large content)
-            let keys: Vec<&str> = json.as_object()
+            let keys: Vec<&str> = json
+                .as_object()
                 .map(|obj| obj.keys().map(|k| k.as_str()).collect())
                 .unwrap_or_default();
             if keys.is_empty() {
@@ -325,8 +312,8 @@ pub enum HistoryType {
     Assistant,
     Error,
     System,
-    ToolUse,      // Tool usage display (e.g., "[Bash]")
-    ToolResult,   // Tool execution result
+    ToolUse,    // Tool usage display (e.g., "[Bash]")
+    ToolResult, // Tool execution result
 }
 
 /// Placeholder messages for AI input
@@ -346,12 +333,23 @@ pub struct AIScreenState {
     pub session_id: Option<String>,
     pub is_processing: bool,
     pub scroll_offset: usize,
-    pub auto_scroll: bool,  // 자동 스크롤 활성화 여부
+    pub auto_scroll: bool, // 자동 스크롤 활성화 여부
     pub claude_available: bool,
     pub current_path: String,
     pub placeholder_index: usize,
     /// Channel receiver for streaming Claude responses
     response_receiver: Option<Receiver<StreamMessage>>,
+    /// Best-effort completion latch for the background worker thread.
+    ///
+    /// Stream completion normally arrives via Done/Error or channel disconnect.
+    /// If that terminal signal is missed while the worker still exits, we use
+    /// this latch to avoid leaving `Processing...` stuck forever.
+    response_worker_done: Option<Arc<AtomicBool>>,
+    /// Cooperative cancellation token for the active background worker.
+    ///
+    /// This allows Escape/cancel to terminate the actual Claude process
+    /// instead of only hiding the UI spinner while the worker keeps running.
+    response_cancel_token: Option<Arc<crate::services::claude::CancelToken>>,
     /// Buffer for accumulating streaming text response
     streaming_buffer: String,
     /// Last known max scroll value (cached from draw)
@@ -366,10 +364,6 @@ pub struct AIScreenState {
     pub last_raw_lines: usize,
     /// Whether AI screen is in fullscreen mode (toggle with Ctrl+F)
     pub ai_fullscreen: bool,
-    /// Cancel token for the in-flight request. Set by `submit()` and
-    /// consumed by `cancel_processing()` to SIGKILL the child Claude
-    /// process so it does not keep running in the background.
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
 }
 
 /// Maximum number of history items to retain
@@ -389,9 +383,9 @@ pub struct SessionData {
     pub provider: String,
 }
 
-/// Get the AI sessions directory path (~/.cokacdir/ai_sessions)
+/// Get the AI sessions directory path (state-root/ai_sessions)
 pub fn ai_sessions_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cokacdir").join("ai_sessions"))
+    ai_state_root_subdir("ai_sessions")
 }
 
 impl AIScreenState {
@@ -427,14 +421,10 @@ impl AIScreenState {
             return false;
         }
 
-        // A leading `-` would be parsed as a CLI flag if this id is ever
-        // spliced into an argv list.
-        if session_id.starts_with('-') {
-            return false;
-        }
-
         // Only allow alphanumeric, dash, underscore
-        session_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        session_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }
 
     /// Save current session to file (~/.cokacdir/ai_sessions/[session_id].json)
@@ -450,7 +440,9 @@ impl AIScreenState {
         }
 
         // Filter out system messages - save all conversation content including tool calls
-        let saveable_history: Vec<HistoryItem> = self.history.iter()
+        let saveable_history: Vec<HistoryItem> = self
+            .history
+            .iter()
             .filter(|item| !matches!(item.item_type, HistoryType::System))
             .cloned()
             .collect();
@@ -511,11 +503,15 @@ impl AIScreenState {
                         if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
                             // Only consider sessions with matching path (TUI is Claude-only; skip codex sessions)
                             if session_data.current_path == current_path
-                                && (session_data.provider.is_empty() || session_data.provider == "claude") {
+                                && (session_data.provider.is_empty()
+                                    || session_data.provider == "claude")
+                            {
                                 if let Ok(metadata) = path.metadata() {
                                     if let Ok(modified) = metadata.modified() {
                                         match &matching_session {
-                                            None => matching_session = Some((session_data, modified)),
+                                            None => {
+                                                matching_session = Some((session_data, modified))
+                                            }
                                             Some((_, latest_time)) if modified > *latest_time => {
                                                 matching_session = Some((session_data, modified));
                                             }
@@ -541,14 +537,20 @@ impl AIScreenState {
             input_lines: vec![String::new()],
             cursor_line: 0,
             cursor_col: 0,
-            session_id: if session_data.session_id.is_empty() { None } else { Some(session_data.session_id) },
+            session_id: if session_data.session_id.is_empty() {
+                None
+            } else {
+                Some(session_data.session_id)
+            },
             is_processing: false,
-            scroll_offset: usize::MAX,  // Sentinel: scroll to bottom on first draw
+            scroll_offset: usize::MAX, // Sentinel: scroll to bottom on first draw
             auto_scroll: true,
             claude_available,
-            current_path,  // Use current path, not session's stored path
+            current_path, // Use current path, not session's stored path
             placeholder_index,
             response_receiver: None,
+            response_worker_done: None,
+            response_cancel_token: None,
             streaming_buffer: String::new(),
             last_max_scroll: 0,
             last_total_lines: 0,
@@ -556,7 +558,6 @@ impl AIScreenState {
             last_visible_width: 0,
             last_raw_lines: 0,
             ai_fullscreen: false,
-            cancel_token: None,
         };
 
         // Add warning message first
@@ -593,6 +594,8 @@ impl AIScreenState {
             current_path,
             placeholder_index,
             response_receiver: None,
+            response_worker_done: None,
+            response_cancel_token: None,
             streaming_buffer: String::new(),
             last_max_scroll: 0,
             last_total_lines: 0,
@@ -600,7 +603,6 @@ impl AIScreenState {
             last_visible_width: 0,
             last_raw_lines: 0,
             ai_fullscreen: false,
-            cancel_token: None,
         };
 
         // Add warning message as first line
@@ -617,7 +619,8 @@ impl AIScreenState {
         } else if !claude_available {
             state.history.push(HistoryItem {
                 item_type: HistoryType::Error,
-                content: "Claude CLI not found. Run 'which claude' to verify installation.".to_string(),
+                content: "Claude CLI not found. Run 'which claude' to verify installation."
+                    .to_string(),
             });
         }
 
@@ -844,7 +847,11 @@ impl AIScreenState {
         debug_log("=== submit() called ===");
         let input_text = self.get_input_text();
         if input_text.trim().is_empty() || self.is_processing {
-            debug_log(&format!("submit() early return: empty={}, processing={}", input_text.trim().is_empty(), self.is_processing));
+            debug_log(&format!(
+                "submit() early return: empty={}, processing={}",
+                input_text.trim().is_empty(),
+                self.is_processing
+            ));
             return;
         }
 
@@ -858,7 +865,11 @@ impl AIScreenState {
             return;
         }
 
-        debug_log(&format!("submit: START - input_len={}, current_path={}", user_input.len(), self.current_path));
+        debug_log(&format!(
+            "submit: START - input_len={}, current_path={}",
+            user_input.len(),
+            self.current_path
+        ));
         let input_preview: String = user_input.chars().take(100).collect();
         debug_log(&format!("submit: user_input preview: {:?}", input_preview));
 
@@ -868,7 +879,10 @@ impl AIScreenState {
             item_type: HistoryType::User,
             content: user_input.clone(),
         });
-        debug_log(&format!("submit: History length after add: {}", self.history.len()));
+        debug_log(&format!(
+            "submit: History length after add: {}",
+            self.history.len()
+        ));
 
         // Set processing state
         self.is_processing = true;
@@ -877,7 +891,10 @@ impl AIScreenState {
 
         // Sanitize user input to prevent prompt injection
         let sanitized_input = sanitize_user_input(&user_input);
-        debug_log(&format!("submit: Sanitized input len={}", sanitized_input.len()));
+        debug_log(&format!(
+            "submit: Sanitized input len={}",
+            sanitized_input.len()
+        ));
 
         // Prepare context for async execution with clear boundaries
         let context_prompt = format!(
@@ -894,7 +911,10 @@ If the user asks to perform file operations, provide clear instructions.
 Keep responses concise and terminal-friendly.",
             self.current_path, sanitized_input
         );
-        debug_log(&format!("submit: Context prompt prepared, total len={}", context_prompt.len()));
+        debug_log(&format!(
+            "submit: Context prompt prepared, total len={}",
+            context_prompt.len()
+        ));
 
         let session_id = self.session_id.clone();
         let current_path = self.current_path.clone();
@@ -903,19 +923,28 @@ Keep responses concise and terminal-friendly.",
         // Create channel for streaming response
         let (tx, rx) = mpsc::channel();
         self.response_receiver = Some(rx);
+        let worker_done = Arc::new(AtomicBool::new(false));
+        self.response_worker_done = Some(worker_done.clone());
+        let cancel_token = Arc::new(claude::CancelToken::new());
+        self.response_cancel_token = Some(cancel_token.clone());
         debug_log("submit: Channel created, receiver stored");
-
-        // Create a cancel token so ESC can SIGKILL the spawned Claude
-        // process; without it the child runs to completion in the
-        // background and accumulates across cancel/resubmit cycles.
-        let cancel_token = std::sync::Arc::new(CancelToken::new());
-        self.cancel_token = Some(cancel_token.clone());
 
         // Spawn thread to execute Claude command with streaming
         debug_log("submit: Spawning worker thread...");
         thread::spawn(move || {
+            struct WorkerDoneGuard(Arc<AtomicBool>);
+            impl Drop for WorkerDoneGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+
+            let _worker_done_guard = WorkerDoneGuard(worker_done);
             debug_log("submit:thread: === WORKER THREAD STARTED ===");
-            debug_log(&format!("submit:thread: Calling execute_command_streaming with path={}", current_path));
+            debug_log(&format!(
+                "submit:thread: Calling execute_command_streaming with path={}",
+                current_path
+            ));
             let start_time = std::time::Instant::now();
 
             let result = claude::execute_command_streaming(
@@ -933,12 +962,26 @@ Keep responses concise and terminal-friendly.",
             );
 
             let elapsed = start_time.elapsed();
-            debug_log(&format!("submit:thread: execute_command_streaming returned after {:?}", elapsed));
+            debug_log(&format!(
+                "submit:thread: execute_command_streaming returned after {:?}",
+                elapsed
+            ));
 
             if let Err(e) = result {
-                debug_log(&format!("submit:thread: ERROR from execute_command_streaming: {}", e));
-                let send_result = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
-                debug_log(&format!("submit:thread: Error message send result: {:?}", send_result.is_ok()));
+                debug_log(&format!(
+                    "submit:thread: ERROR from execute_command_streaming: {}",
+                    e
+                ));
+                let send_result = tx.send(StreamMessage::Error {
+                    message: e,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
+                debug_log(&format!(
+                    "submit:thread: Error message send result: {:?}",
+                    send_result.is_ok()
+                ));
             } else {
                 debug_log("submit:thread: execute_command_streaming completed successfully");
             }
@@ -1008,12 +1051,20 @@ Keep responses concise and terminal-friendly.",
                         content
                     };
                     self.add_to_history(HistoryItem {
-                        item_type: if is_error { HistoryType::Error } else { HistoryType::ToolResult },
+                        item_type: if is_error {
+                            HistoryType::Error
+                        } else {
+                            HistoryType::ToolResult
+                        },
                         content: display_content,
                     });
                     has_new_content = true;
                 }
-                StreamMessage::TaskNotification { task_id, status, summary } => {
+                StreamMessage::TaskNotification {
+                    task_id,
+                    status,
+                    summary,
+                } => {
                     // Display background task notification as system message
                     let notification = format!("[Task {}] {}: {}", task_id, status, summary);
                     self.add_to_history(HistoryItem {
@@ -1063,11 +1114,35 @@ Keep responses concise and terminal-friendly.",
             has_new_content = true;
         }
 
+        let worker_finished = self
+            .response_worker_done
+            .as_ref()
+            .map(|done| done.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if worker_finished && !processing_done {
+            debug_log(
+                "poll_response: worker finished without terminal stream signal; forcing completion",
+            );
+            if !self.streaming_buffer.is_empty() {
+                let buffer = self.streaming_buffer.clone();
+                self.finalize_streaming_history(&buffer);
+                has_new_content = true;
+            } else {
+                self.add_to_history(HistoryItem {
+                    item_type: HistoryType::System,
+                    content: WORKER_FINISHED_WITHOUT_RESPONSE_MESSAGE.to_string(),
+                });
+                has_new_content = true;
+            }
+            processing_done = true;
+        }
+
         // Clean up if processing is done
         if processing_done {
             self.is_processing = false;
             self.response_receiver = None;
-            self.cancel_token = None;
+            self.response_worker_done = None;
+            self.response_cancel_token = None;
         }
 
         has_new_content
@@ -1108,7 +1183,10 @@ Keep responses concise and terminal-friendly.",
             let normalized = normalize_empty_lines(final_result);
 
             // Find the last Assistant item and update it
-            let found_assistant = self.history.iter_mut().rev()
+            let found_assistant = self
+                .history
+                .iter_mut()
+                .rev()
                 .find(|h| h.item_type == HistoryType::Assistant);
 
             if let Some(last) = found_assistant {
@@ -1131,11 +1209,12 @@ Keep responses concise and terminal-friendly.",
     /// Cancel the current processing request
     pub fn cancel_processing(&mut self) {
         if self.is_processing {
-            if let Some(token) = self.cancel_token.take() {
-                token.cancel_now();
+            if let Some(cancel_token) = self.response_cancel_token.take() {
+                cancel_token.cancel_now();
             }
             self.is_processing = false;
             self.response_receiver = None;
+            self.response_worker_done = None;
             self.add_to_history(HistoryItem {
                 item_type: HistoryType::System,
                 content: "Cancelled.".to_string(),
@@ -1153,10 +1232,15 @@ pub fn draw(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme: &Th
     draw_with_focus(frame, state, area, theme, true)
 }
 
-pub fn draw_with_focus(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme: &Theme, focused: bool) {
+pub fn draw_with_focus(
+    frame: &mut Frame,
+    state: &mut AIScreenState,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+) {
     // Fill background first
-    let background = Block::default()
-        .style(Style::default().bg(theme.ai_screen.bg));
+    let background = Block::default().style(Style::default().bg(theme.ai_screen.bg));
     frame.render_widget(background, area);
 
     // Calculate input area height based on display width (like Handler)
@@ -1168,9 +1252,7 @@ pub fn draw_with_focus(frame: &mut Frame, state: &mut AIScreenState, area: Rect,
         if line_text.is_empty() {
             total_display_lines += 1;
         } else {
-            let line_display_width: usize = line_text.chars()
-                .map(|c| c.width().unwrap_or(1))
-                .sum();
+            let line_display_width: usize = line_text.chars().map(|c| c.width().unwrap_or(1)).sum();
             // +1 for cursor if this is the cursor line
             let total_width = line_display_width + 1;
             let line_count = if input_width > 0 {
@@ -1189,8 +1271,8 @@ pub fn draw_with_focus(frame: &mut Frame, state: &mut AIScreenState, area: Rect,
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // History area (no bottom border)
-            Constraint::Length(1), // Separator line (├───┤)
+            Constraint::Min(5),               // History area (no bottom border)
+            Constraint::Length(1),            // Separator line (├───┤)
             Constraint::Length(input_height), // Input area (dynamic height)
         ])
         .split(area);
@@ -1205,7 +1287,13 @@ pub fn draw_with_focus(frame: &mut Frame, state: &mut AIScreenState, area: Rect,
     draw_input(frame, state, chunks[2], theme, focused);
 }
 
-fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme: &Theme, focused: bool) {
+fn draw_history(
+    frame: &mut Frame,
+    state: &mut AIScreenState,
+    area: Rect,
+    theme: &Theme,
+    focused: bool,
+) {
     // Build title with path and session info
     let session_info = if let Some(ref sid) = state.session_id {
         let sid_preview: String = sid.chars().take(8).collect();
@@ -1217,10 +1305,18 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
     let title = format!(" {} | {} ", state.current_path, session_info);
 
     // 포커스 여부에 따라 테두리 색상 결정
-    let border_color = if focused { theme.ai_screen.history_border } else { theme.panel.border };
+    let border_color = if focused {
+        theme.ai_screen.history_border
+    } else {
+        theme.panel.border
+    };
 
     // 타이틀 색상도 테두리와 동일하게
-    let title_color = if focused { theme.ai_screen.history_title } else { theme.panel.border };
+    let title_color = if focused {
+        theme.ai_screen.history_title
+    } else {
+        theme.panel.border
+    };
 
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
@@ -1228,7 +1324,9 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
         .style(Style::default().bg(theme.ai_screen.bg))
         .title(Span::styled(
             title,
-            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(title_color)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -1261,14 +1359,22 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
                         // First line is the tool name with bracket style
                         lines.push(Line::from(vec![
                             Span::styled("[", Style::default().fg(theme.ai_screen.tool_use_prefix)),
-                            Span::styled(line_text.to_string(), Style::default().fg(theme.ai_screen.tool_use_name).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                line_text.to_string(),
+                                Style::default()
+                                    .fg(theme.ai_screen.tool_use_name)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                             Span::styled("]", Style::default().fg(theme.ai_screen.tool_use_prefix)),
                         ]));
                     } else {
                         // Subsequent lines show simplified parameters
                         lines.push(Line::from(vec![
                             Span::styled("  ", Style::default()),
-                            Span::styled(line_text.to_string(), Style::default().fg(theme.ai_screen.tool_use_input)),
+                            Span::styled(
+                                line_text.to_string(),
+                                Style::default().fg(theme.ai_screen.tool_use_input),
+                            ),
                         ]));
                     }
                 }
@@ -1279,8 +1385,16 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
                 for (i, line_text) in content_lines.iter().enumerate() {
                     let prefix = if i == 0 { "-> " } else { "   " };
                     lines.push(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(theme.ai_screen.tool_result_prefix).add_modifier(Modifier::BOLD)),
-                        Span::styled(line_text.to_string(), Style::default().fg(theme.ai_screen.tool_result_text)),
+                        Span::styled(
+                            prefix,
+                            Style::default()
+                                .fg(theme.ai_screen.tool_result_prefix)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            line_text.to_string(),
+                            Style::default().fg(theme.ai_screen.tool_result_text),
+                        ),
                     ]));
                 }
             }
@@ -1341,19 +1455,21 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
     // Convert empty lines to NBSP to prevent Paragraph from rendering multiple rows
     // Paragraph with Wrap renders empty/whitespace Line as multiple blank rows
     // NBSP (Non-Breaking Space, \u{00A0}) is rendered as exactly 1 row
-    let lines: Vec<Line> = filtered_lines.into_iter().map(|line| {
-        if is_line_empty(&line) {
-            Line::from("\u{00A0}")  // NBSP renders as 1 row
-        } else {
-            line
-        }
-    }).collect();
+    let lines: Vec<Line> = filtered_lines
+        .into_iter()
+        .map(|line| {
+            if is_line_empty(&line) {
+                Line::from("\u{00A0}") // NBSP renders as 1 row
+            } else {
+                line
+            }
+        })
+        .collect();
 
     // Use ratatui's Paragraph::line_count() for accurate wrapped line calculation
     let width = inner.width as usize;
     let raw_line_count = lines.len();
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let total_lines = if width == 0 {
         raw_line_count
     } else {
@@ -1397,11 +1513,7 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
     if total_lines > visible_height {
         // Use original total_lines for display (not buffered value)
         let display_position = (effective_scroll + visible_height).min(total_lines);
-        let scroll_info = format!(
-            " [{}/{}] ",
-            display_position,
-            total_lines
-        );
+        let scroll_info = format!(" [{}/{}] ", display_position, total_lines);
         let info_len = scroll_info.len() as u16;
         let indicator_x = inner.x + inner.width.saturating_sub(info_len + 1);
         frame.render_widget(
@@ -1420,7 +1532,11 @@ fn draw_separator(frame: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
         return;
     }
 
-    let border_color = if focused { theme.ai_screen.history_border } else { theme.panel.border };
+    let border_color = if focused {
+        theme.ai_screen.history_border
+    } else {
+        theme.panel.border
+    };
     let border_style = Style::default().fg(border_color);
 
     // Build separator line: ├ + ─── + ┤
@@ -1435,7 +1551,11 @@ fn draw_separator(frame: &mut Frame, area: Rect, theme: &Theme, focused: bool) {
 
 fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Theme, focused: bool) {
     // Use only LEFT, RIGHT, BOTTOM borders (top is shared separator line)
-    let border_color = if focused { theme.ai_screen.input_border } else { theme.panel.border };
+    let border_color = if focused {
+        theme.ai_screen.input_border
+    } else {
+        theme.panel.border
+    };
     let block = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
         .border_style(Style::default().fg(border_color))
@@ -1449,7 +1569,9 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
         let frame_idx = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() / 100) as usize % spinner_frames.len();
+            .as_millis()
+            / 100) as usize
+            % spinner_frames.len();
 
         let processing_line = Line::from(vec![
             Span::styled(
@@ -1484,7 +1606,10 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
             let placeholder_line = Line::from(vec![
                 Span::styled("> ", prompt_style),
                 Span::styled(" ", cursor_style),
-                Span::styled(state.get_placeholder(), Style::default().fg(theme.ai_screen.input_placeholder)),
+                Span::styled(
+                    state.get_placeholder(),
+                    Style::default().fg(theme.ai_screen.input_placeholder),
+                ),
             ]);
             frame.render_widget(Paragraph::new(placeholder_line), inner);
         } else {
@@ -1614,7 +1739,11 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
                 } else {
                     0
                 };
-                all_lines.into_iter().skip(scroll_start).take(max_visible_lines).collect()
+                all_lines
+                    .into_iter()
+                    .skip(scroll_start)
+                    .take(max_visible_lines)
+                    .collect()
             } else {
                 all_lines
             };
@@ -1636,7 +1765,7 @@ fn scroll_up(state: &mut AIScreenState, amount: usize) {
 
     if current_scroll > 0 {
         state.scroll_offset = current_scroll.saturating_sub(amount);
-        state.auto_scroll = false;  // 수동 스크롤 시 비활성화
+        state.auto_scroll = false; // 수동 스크롤 시 비활성화
     }
 }
 
@@ -1667,7 +1796,12 @@ pub fn handle_paste(state: &mut AIScreenState, text: &str) {
     }
 }
 
-pub fn handle_input(state: &mut AIScreenState, code: KeyCode, modifiers: KeyModifiers, kb: &Keybindings) -> bool {
+pub fn handle_input(
+    state: &mut AIScreenState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kb: &Keybindings,
+) -> bool {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let shift = modifiers.contains(KeyModifiers::SHIFT);
 
@@ -1784,7 +1918,10 @@ pub fn handle_input(state: &mut AIScreenState, code: KeyCode, modifiers: KeyModi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keybindings::{KeybindingsConfig, Keybindings};
+    use crate::keybindings::{Keybindings, KeybindingsConfig};
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
 
     fn create_test_state() -> AIScreenState {
         let mut state = AIScreenState::new("/test".to_string());
@@ -1801,10 +1938,32 @@ mod tests {
         Keybindings::from_config(&KeybindingsConfig::default())
     }
 
+    fn state_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_state_root_env<T>(value: Option<&Path>, f: impl FnOnce() -> T) -> T {
+        let _guard = state_root_env_lock().lock().unwrap();
+        let previous = std::env::var_os(crate::config::STATE_ROOT_ENV_VAR);
+        match value {
+            Some(path) => std::env::set_var(crate::config::STATE_ROOT_ENV_VAR, path),
+            None => std::env::remove_var(crate::config::STATE_ROOT_ENV_VAR),
+        }
+        let previous_debug = crate::services::claude::DEBUG_ENABLED.load(Ordering::Relaxed);
+        let result = f();
+        crate::services::claude::DEBUG_ENABLED.store(previous_debug, Ordering::Relaxed);
+        match previous {
+            Some(value) => std::env::set_var(crate::config::STATE_ROOT_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::STATE_ROOT_ENV_VAR),
+        }
+        result
+    }
+
     #[test]
     fn test_scroll_up_from_sentinel() {
         let mut state = create_test_state();
-        state.scroll_offset = usize::MAX;  // Sentinel value
+        state.scroll_offset = usize::MAX; // Sentinel value
         state.auto_scroll = true;
 
         scroll_up(&mut state, 1);
@@ -1888,9 +2047,14 @@ mod tests {
         state.last_visible_height = 20;
 
         // PageUp should scroll by visible_height - 1 = 19
-        handle_input(&mut state, KeyCode::PageUp, KeyModifiers::empty(), &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::PageUp,
+            KeyModifiers::empty(),
+            &default_kb(),
+        );
 
-        assert_eq!(state.scroll_offset, 21);  // 40 - 19 = 21
+        assert_eq!(state.scroll_offset, 21); // 40 - 19 = 21
     }
 
     #[test]
@@ -1901,9 +2065,14 @@ mod tests {
         state.last_visible_height = 20;
 
         // PageDown should scroll by visible_height - 1 = 19
-        handle_input(&mut state, KeyCode::PageDown, KeyModifiers::empty(), &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::PageDown,
+            KeyModifiers::empty(),
+            &default_kb(),
+        );
 
-        assert_eq!(state.scroll_offset, 29);  // 10 + 19 = 29
+        assert_eq!(state.scroll_offset, 29); // 10 + 19 = 29
     }
 
     #[test]
@@ -1912,7 +2081,12 @@ mod tests {
         state.scroll_offset = 30;
         state.auto_scroll = true;
 
-        handle_input(&mut state, KeyCode::Home, KeyModifiers::CONTROL, &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::Home,
+            KeyModifiers::CONTROL,
+            &default_kb(),
+        );
 
         assert_eq!(state.scroll_offset, 0);
         assert!(!state.auto_scroll);
@@ -1924,9 +2098,14 @@ mod tests {
         state.scroll_offset = 10;
         state.auto_scroll = false;
 
-        handle_input(&mut state, KeyCode::End, KeyModifiers::CONTROL, &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::End,
+            KeyModifiers::CONTROL,
+            &default_kb(),
+        );
 
-        assert_eq!(state.scroll_offset, 50);  // last_max_scroll
+        assert_eq!(state.scroll_offset, 50); // last_max_scroll
         assert!(state.auto_scroll);
     }
 
@@ -1937,7 +2116,12 @@ mod tests {
         state.scroll_offset = 30;
         state.auto_scroll = false;
 
-        handle_input(&mut state, KeyCode::Up, KeyModifiers::empty(), &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::Up,
+            KeyModifiers::empty(),
+            &default_kb(),
+        );
 
         assert_eq!(state.scroll_offset, 29);
     }
@@ -1950,7 +2134,12 @@ mod tests {
         state.cursor_col = 2;
         state.scroll_offset = 30;
 
-        handle_input(&mut state, KeyCode::Up, KeyModifiers::empty(), &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::Up,
+            KeyModifiers::empty(),
+            &default_kb(),
+        );
 
         // Cursor should move up, scroll should stay same
         assert_eq!(state.cursor_line, 0);
@@ -1964,7 +2153,12 @@ mod tests {
         state.cursor_line = 1;
         state.scroll_offset = 30;
 
-        handle_input(&mut state, KeyCode::Up, KeyModifiers::CONTROL, &default_kb());
+        handle_input(
+            &mut state,
+            KeyCode::Up,
+            KeyModifiers::CONTROL,
+            &default_kb(),
+        );
 
         // Cursor should NOT move, scroll should change
         assert_eq!(state.cursor_line, 1);
@@ -1978,7 +2172,7 @@ mod tests {
         state.scroll_offset = 0;
 
         scroll_up(&mut state, 1);
-        assert_eq!(state.scroll_offset, 0);  // Can't scroll up from 0
+        assert_eq!(state.scroll_offset, 0); // Can't scroll up from 0
 
         scroll_down(&mut state, 1);
         // scroll_down no longer caps - draw() will normalize to 0
@@ -2019,7 +2213,7 @@ mod tests {
         let total_lines = 25usize;
 
         let max_scroll = total_lines.saturating_sub(visible_height);
-        assert_eq!(max_scroll, 15);  // 25 - 10 = 15
+        assert_eq!(max_scroll, 15); // 25 - 10 = 15
 
         // When at max_scroll, last line should be at bottom
         // scroll_offset = 15 means we skip first 15 lines
@@ -2039,7 +2233,7 @@ mod tests {
 
         // Verify: at max_scroll, the last visible line is total_lines
         let scroll_offset = max_scroll;
-        let first_visible = scroll_offset + 1;  // 1-indexed
+        let first_visible = scroll_offset + 1; // 1-indexed
         let last_visible = scroll_offset + visible_height;
 
         assert_eq!(first_visible, 11);
@@ -2076,17 +2270,22 @@ mod tests {
             .word_separator(textwrap::WordSeparator::UnicodeBreakProperties)
             .word_splitter(textwrap::WordSplitter::NoHyphenation);
 
-        let total_lines: usize = lines.iter().map(|line| {
-            let full_text: String = line.spans.iter()
-                .map(|span| span.content.as_ref())
-                .collect();
+        let total_lines: usize = lines
+            .iter()
+            .map(|line| {
+                let full_text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
 
-            if full_text.is_empty() {
-                1
-            } else {
-                textwrap::wrap(&full_text, &wrap_options).len()
-            }
-        }).sum();
+                if full_text.is_empty() {
+                    1
+                } else {
+                    textwrap::wrap(&full_text, &wrap_options).len()
+                }
+            })
+            .sum();
 
         let max_scroll = total_lines.saturating_sub(visible_height);
 
@@ -2095,9 +2294,13 @@ mod tests {
         println!("Max scroll: {}", max_scroll);
 
         // At max_scroll, should be able to see all content
-        assert!(max_scroll + visible_height >= total_lines,
+        assert!(
+            max_scroll + visible_height >= total_lines,
             "max_scroll ({}) + visible_height ({}) should >= total_lines ({})",
-            max_scroll, visible_height, total_lines);
+            max_scroll,
+            visible_height,
+            total_lines
+        );
     }
 
     #[test]
@@ -2131,7 +2334,10 @@ mod tests {
 
             let display_text: String = text.chars().take(40).collect();
             println!("Text: {:?}", display_text);
-            println!("  Width: {}, textwrap: {}, simple: {}", text_width, textwrap_lines, simple_lines);
+            println!(
+                "  Width: {}, textwrap: {}, simple: {}",
+                text_width, textwrap_lines, simple_lines
+            );
 
             // textwrap should give equal or MORE lines than simple (due to word boundaries)
             if textwrap_lines < simple_lines {
@@ -2156,7 +2362,7 @@ mod tests {
 
         // Verify that at max_scroll=1, we see lines 2-11 (skipping line 1)
         let scroll_offset = 1usize;
-        let last_visible_line = scroll_offset + visible_height;  // 1 + 10 = 11
+        let last_visible_line = scroll_offset + visible_height; // 1 + 10 = 11
         assert_eq!(last_visible_line, total_lines);
     }
 
@@ -2164,17 +2370,19 @@ mod tests {
     fn test_scroll_to_last_line() {
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap},
-            text::Line,
             layout::Rect,
+            text::Line,
+            widgets::{Paragraph, Wrap},
+            Terminal,
         };
 
         // Create content with known lines
-        let lines: Vec<Line> = (1..=15).map(|i| Line::from(format!("Line {}", i))).collect();
+        let lines: Vec<Line> = (1..=15)
+            .map(|i| Line::from(format!("Line {}", i)))
+            .collect();
 
         let width = 40u16;
-        let height = 10u16;  // Can show 10 lines
+        let height = 10u16; // Can show 10 lines
 
         // Total 15 lines, visible 10 → max_scroll = 5
         // At scroll=5, should show lines 6-15 (last line is "Line 15")
@@ -2183,14 +2391,16 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         // Render at max scroll
-        let max_scroll = 15 - 10;  // 5
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, width, height);
-            let paragraph = Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false })
-                .scroll((max_scroll as u16, 0));
-            frame.render_widget(paragraph, area);
-        }).unwrap();
+        let max_scroll = 15 - 10; // 5
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                let paragraph = Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((max_scroll as u16, 0));
+                frame.render_widget(paragraph, area);
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
 
@@ -2200,10 +2410,17 @@ mod tests {
             let cell = buffer.cell((x, height - 1)).unwrap();
             last_row_content.push_str(cell.symbol());
         }
-        println!("Last row (row {}): |{}|", height - 1, last_row_content.trim_end());
+        println!(
+            "Last row (row {}): |{}|",
+            height - 1,
+            last_row_content.trim_end()
+        );
 
-        assert!(last_row_content.contains("Line 15"),
-            "Last row should contain 'Line 15', got: '{}'", last_row_content.trim_end());
+        assert!(
+            last_row_content.contains("Line 15"),
+            "Last row should contain 'Line 15', got: '{}'",
+            last_row_content.trim_end()
+        );
 
         // Print all rows for debugging
         println!("\nAll rows at max_scroll={}:", max_scroll);
@@ -2221,10 +2438,10 @@ mod tests {
     fn test_draw_history_simulation() {
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap, Block, Borders},
-            text::Line,
             layout::Rect,
+            text::Line,
+            widgets::{Block, Borders, Paragraph, Wrap},
+            Terminal,
         };
 
         // Simulate draw_history structure
@@ -2234,11 +2451,11 @@ mod tests {
         for i in 1..=5 {
             lines.push(Line::from(format!("> Message {}", i)));
             lines.push(Line::from(format!("< Response to message {}", i)));
-            lines.push(Line::from(""));  // Empty line between messages
+            lines.push(Line::from("")); // Empty line between messages
         }
 
         let width = 40u16;
-        let area_height = 12u16;  // Total area including borders
+        let area_height = 12u16; // Total area including borders
 
         // Create block with borders (like draw_history)
         let block = Block::default().borders(Borders::ALL);
@@ -2255,12 +2472,21 @@ mod tests {
             .word_separator(textwrap::WordSeparator::UnicodeBreakProperties)
             .word_splitter(textwrap::WordSplitter::NoHyphenation);
 
-        let total_lines: usize = lines.iter().map(|line| {
-            let full_text: String = line.spans.iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            if full_text.is_empty() { 1 } else { textwrap::wrap(&full_text, &wrap_options).len() }
-        }).sum();
+        let total_lines: usize = lines
+            .iter()
+            .map(|line| {
+                let full_text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if full_text.is_empty() {
+                    1
+                } else {
+                    textwrap::wrap(&full_text, &wrap_options).len()
+                }
+            })
+            .sum();
 
         let max_scroll = total_lines.saturating_sub(visible_height);
 
@@ -2273,13 +2499,15 @@ mod tests {
         let backend = TestBackend::new(width, area_height);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| {
-            frame.render_widget(block.clone(), area);
-            let paragraph = Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false })
-                .scroll((max_scroll as u16, 0));
-            frame.render_widget(paragraph, inner);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(block.clone(), area);
+                let paragraph = Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((max_scroll as u16, 0));
+                frame.render_widget(paragraph, inner);
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         println!("\nRendered at max_scroll={}:", max_scroll);
@@ -2301,20 +2529,22 @@ mod tests {
     fn test_ratatui_actual_rendering() {
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap},
-            text::Line,
             layout::Rect,
+            text::Line,
+            widgets::{Paragraph, Wrap},
+            Terminal,
         };
 
         // Create a test terminal with specific size
-        let backend = TestBackend::new(40, 10);  // 40 chars wide, 10 rows
+        let backend = TestBackend::new(40, 10); // 40 chars wide, 10 rows
         let mut terminal = Terminal::new(backend).unwrap();
 
         // Create test content - lines that should wrap
         let lines: Vec<Line> = vec![
             Line::from("Line 1: Short"),
-            Line::from("Line 2: This is a longer line that should wrap to multiple lines in 40 char width"),
+            Line::from(
+                "Line 2: This is a longer line that should wrap to multiple lines in 40 char width",
+            ),
             Line::from("Line 3: Another line"),
             Line::from("Line 4: Yet another longer line that will definitely wrap around"),
             Line::from("Line 5: End"),
@@ -2328,23 +2558,33 @@ mod tests {
             .word_separator(textwrap::WordSeparator::UnicodeBreakProperties)
             .word_splitter(textwrap::WordSplitter::NoHyphenation);
 
-        let textwrap_total: usize = lines.iter().map(|line| {
-            let full_text: String = line.spans.iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            if full_text.is_empty() { 1 } else { textwrap::wrap(&full_text, &wrap_options).len() }
-        }).sum();
+        let textwrap_total: usize = lines
+            .iter()
+            .map(|line| {
+                let full_text: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                if full_text.is_empty() {
+                    1
+                } else {
+                    textwrap::wrap(&full_text, &wrap_options).len()
+                }
+            })
+            .sum();
 
         println!("Width: {}, Height: {}", width, height);
         println!("Textwrap calculated total lines: {}", textwrap_total);
 
         // Render and check
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, width, height);
-            let paragraph = Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, area);
+            })
+            .unwrap();
 
         // Print what was rendered
         let buffer = terminal.backend().buffer();
@@ -2385,11 +2625,11 @@ mod tests {
     fn test_multiple_lines_with_empty() {
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap},
-            text::{Line, Span},
-            style::Style,
             layout::Rect,
+            style::Style,
+            text::{Line, Span},
+            widgets::{Paragraph, Wrap},
+            Terminal,
         };
 
         let width = 40u16;
@@ -2407,12 +2647,13 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, width, height);
-            let paragraph = Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, area);
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
 
@@ -2440,28 +2681,34 @@ mod tests {
             let cell = buffer.cell((x, 6)).unwrap();
             row6.push_str(cell.symbol());
         }
-        assert!(row6.contains("Line 5"),
-            "Line 5 should be at Row 6 (whitespace-only lines take 2 rows). Got: '{}'", row6.trim());
+        assert!(
+            row6.contains("Line 5"),
+            "Line 5 should be at Row 6 (whitespace-only lines take 2 rows). Got: '{}'",
+            row6.trim()
+        );
 
         // Verify Paragraph::line_count matches
         let line_count_total = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .line_count(width) as usize;
         println!("Paragraph::line_count: {}", line_count_total);
-        assert_eq!(line_count_total, 7, "line_count should be 7 (3 normal + 2*2 whitespace)");
+        assert_eq!(
+            line_count_total, 7,
+            "line_count should be 7 (3 normal + 2*2 whitespace)"
+        );
     }
 
     #[test]
     fn test_markdown_rendering_line_count() {
+        use crate::utils::markdown::{render_markdown, MarkdownTheme};
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap},
-            text::{Line, Span},
-            style::{Style, Modifier, Color},
             layout::Rect,
+            style::{Color, Modifier, Style},
+            text::{Line, Span},
+            widgets::{Paragraph, Wrap},
+            Terminal,
         };
-        use crate::utils::markdown::{render_markdown, MarkdownTheme};
 
         let width = 80u16;
         let height = 100u16;
@@ -2487,7 +2734,9 @@ fn main() {
         let md_lines = render_markdown(markdown_text, theme);
 
         // Add prefix like draw_history does
-        let prefix_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let prefix_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         let mut lines_with_prefix: Vec<Line> = Vec::new();
         for (i, md_line) in md_lines.into_iter().enumerate() {
             let prefix = if i == 0 { "< " } else { "  " };
@@ -2501,12 +2750,14 @@ fn main() {
         let mut terminal = Terminal::new(backend).unwrap();
 
         // Render
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, width, height);
-            let paragraph = Paragraph::new(lines_with_prefix.clone())
-                .wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                let paragraph =
+                    Paragraph::new(lines_with_prefix.clone()).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, area);
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
 
@@ -2540,18 +2791,18 @@ fn main() {
 
     #[test]
     fn test_scroll_reaches_bottom_with_markdown() {
+        use crate::utils::markdown::{render_markdown, MarkdownTheme};
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap},
-            text::{Line, Span},
-            style::{Style, Modifier, Color},
             layout::Rect,
+            style::{Color, Modifier, Style},
+            text::{Line, Span},
+            widgets::{Paragraph, Wrap},
+            Terminal,
         };
-        use crate::utils::markdown::{render_markdown, MarkdownTheme};
 
         let width = 60u16;
-        let height = 10u16;  // Small visible area to force scrolling
+        let height = 10u16; // Small visible area to force scrolling
 
         // Sample markdown with known last line
         let markdown_text = "Line 1\n\nLine 2\n\nLine 3\n\n**Last line marker**";
@@ -2560,7 +2811,9 @@ fn main() {
         let md_lines = render_markdown(markdown_text, theme);
 
         // Add prefix like draw_history does
-        let prefix_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let prefix_style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         let mut lines_with_prefix: Vec<Line> = Vec::new();
         for (i, md_line) in md_lines.into_iter().enumerate() {
             let prefix = if i == 0 { "< " } else { "  " };
@@ -2571,8 +2824,7 @@ fn main() {
         lines_with_prefix.push(Line::from("")); // Empty line after message
 
         // Calculate using Paragraph::line_count()
-        let paragraph = Paragraph::new(lines_with_prefix.clone())
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines_with_prefix.clone()).wrap(Wrap { trim: false });
         let total_lines = paragraph.line_count(width) as usize;
 
         let visible_height = height as usize;
@@ -2587,13 +2839,15 @@ fn main() {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, width, height);
-            let paragraph = Paragraph::new(lines_with_prefix.clone())
-                .wrap(Wrap { trim: false })
-                .scroll((max_scroll as u16, 0));
-            frame.render_widget(paragraph, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                let paragraph = Paragraph::new(lines_with_prefix.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((max_scroll as u16, 0));
+                frame.render_widget(paragraph, area);
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
 
@@ -2623,24 +2877,27 @@ fn main() {
             }
         }
 
-        assert!(found_marker, "Last line marker should be visible at max_scroll");
+        assert!(
+            found_marker,
+            "Last line marker should be visible at max_scroll"
+        );
     }
 
     #[test]
     fn test_scroll_with_ai_response_simulation() {
+        use crate::utils::markdown::{render_markdown, MarkdownTheme};
         use ratatui::{
             backend::TestBackend,
-            Terminal,
-            widgets::{Paragraph, Wrap, Block, Borders},
-            text::{Line, Span},
-            style::{Style, Modifier, Color},
             layout::Rect,
+            style::{Color, Modifier, Style},
+            text::{Line, Span},
+            widgets::{Block, Borders, Paragraph, Wrap},
+            Terminal,
         };
-        use crate::utils::markdown::{render_markdown, MarkdownTheme};
 
         // Simulate actual AI screen layout - SMALL height to force scrolling
         let total_width = 80u16;
-        let total_height = 12u16;  // Small to force scrolling
+        let total_height = 12u16; // Small to force scrolling
 
         // User message
         let user_content = "Hello, can you help me?";
@@ -2664,7 +2921,9 @@ Let me know what you'd like to do!
         let mut lines: Vec<Line> = Vec::new();
 
         // User message
-        let user_prefix = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let user_prefix = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
         for (i, line_text) in user_content.lines().enumerate() {
             let prefix = if i == 0 { "> " } else { "  " };
             lines.push(Line::from(vec![
@@ -2677,7 +2936,9 @@ Let me know what you'd like to do!
 
         // AI response with markdown
         let md_lines = render_markdown(ai_response, theme);
-        let ai_prefix = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let ai_prefix = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         for (i, md_line) in md_lines.into_iter().enumerate() {
             let prefix = if i == 0 { "< " } else { "  " };
             let mut spans = vec![Span::styled(prefix, ai_prefix)];
@@ -2696,8 +2957,7 @@ Let me know what you'd like to do!
         let width = inner.width as usize;
 
         // Calculate total lines using Paragraph::line_count()
-        let paragraph = Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
         let total_lines = paragraph.line_count(inner.width) as usize;
 
         let max_scroll = total_lines.saturating_sub(visible_height);
@@ -2713,13 +2973,15 @@ Let me know what you'd like to do!
         let backend = TestBackend::new(total_width, total_height);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| {
-            frame.render_widget(block.clone(), area);
-            let paragraph = Paragraph::new(lines.clone())
-                .wrap(Wrap { trim: false })
-                .scroll((max_scroll as u16, 0));
-            frame.render_widget(paragraph, inner);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(block.clone(), area);
+                let paragraph = Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((max_scroll as u16, 0));
+                frame.render_widget(paragraph, inner);
+            })
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
 
@@ -2793,10 +3055,100 @@ Let me know what you'd like to do!
                 assert!(
                     !(prev_empty && is_empty),
                     "Found consecutive empty lines in: {:?} -> {:?}",
-                    text, result
+                    text,
+                    result
                 );
                 prev_empty = is_empty;
             }
         }
+    }
+
+    #[test]
+    fn test_poll_response_clears_processing_when_worker_finished_without_terminal_signal() {
+        let mut state = create_test_state();
+        let (_tx, rx) = mpsc::channel();
+        state.is_processing = true;
+        state.response_receiver = Some(rx);
+        state.response_worker_done = Some(Arc::new(AtomicBool::new(true)));
+
+        let has_new_content = state.poll_response();
+
+        assert!(has_new_content);
+        assert!(!state.is_processing);
+        assert!(state.response_receiver.is_none());
+        assert!(state.response_worker_done.is_none());
+        let last = state
+            .history
+            .last()
+            .expect("system note should be added for silent completion");
+        assert_eq!(last.item_type, HistoryType::System);
+        assert_eq!(last.content, WORKER_FINISHED_WITHOUT_RESPONSE_MESSAGE);
+    }
+
+    #[test]
+    fn test_poll_response_preserves_partial_stream_when_worker_finished_without_terminal_signal() {
+        let mut state = create_test_state();
+        let (_tx, rx) = mpsc::channel();
+        state.is_processing = true;
+        state.response_receiver = Some(rx);
+        state.response_worker_done = Some(Arc::new(AtomicBool::new(true)));
+        state.streaming_buffer = "partial answer".to_string();
+
+        let has_new_content = state.poll_response();
+
+        assert!(has_new_content);
+        assert!(!state.is_processing);
+        let last = state
+            .history
+            .last()
+            .expect("assistant response should be added");
+        assert_eq!(last.item_type, HistoryType::Assistant);
+        assert_eq!(last.content, "partial answer");
+    }
+
+    #[test]
+    fn test_cancel_processing_cancels_worker_token_and_clears_state() {
+        let mut state = create_test_state();
+        let token = Arc::new(crate::services::claude::CancelToken::new());
+        state.is_processing = true;
+        state.response_cancel_token = Some(token.clone());
+        state.response_worker_done = Some(Arc::new(AtomicBool::new(false)));
+
+        state.cancel_processing();
+
+        assert!(!state.is_processing);
+        assert!(state.response_receiver.is_none());
+        assert!(state.response_worker_done.is_none());
+        assert!(state.response_cancel_token.is_none());
+        assert!(token.cancelled.load(Ordering::Relaxed));
+        let last = state.history.last().expect("cancel marker should be added");
+        assert_eq!(last.item_type, HistoryType::System);
+        assert_eq!(last.content, "Cancelled.");
+    }
+
+    #[test]
+    fn test_ai_sessions_dir_uses_state_root_override() {
+        let dir = tempdir().unwrap();
+        let state_root = dir.path().join("state-root");
+        with_state_root_env(Some(&state_root), || {
+            assert_eq!(ai_sessions_dir(), Some(state_root.join("ai_sessions")));
+        });
+    }
+
+    #[test]
+    fn test_debug_log_uses_state_root_override() {
+        let dir = tempdir().unwrap();
+        let state_root = dir.path().join("state-root");
+        with_state_root_env(Some(&state_root), || {
+            crate::services::claude::DEBUG_ENABLED.store(true, Ordering::Relaxed);
+            debug_log("override-path-check");
+            let log_path = state_root.join("debug").join("ai_screen.log");
+            assert!(
+                log_path.exists(),
+                "debug log should exist under override root"
+            );
+            let log = fs::read_to_string(log_path).expect("debug log should be readable");
+            assert!(log.contains("override-path-check"));
+        });
     }
 }

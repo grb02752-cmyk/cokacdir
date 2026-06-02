@@ -90,25 +90,6 @@ pub struct FileInfo {
     pub file_size: Option<u64>,
 }
 
-/// Reason `run_bridge` returned. `Fatal` mirrors the prior
-/// `process::exit(1)` signal so single-bot deployments keep emitting
-/// exit code 1 to supervisors (systemd, docker), while multi-bot
-/// deployments can keep their healthy bots running and propagate the
-/// non-zero exit only after every bot's task has finished.
-pub enum BridgeExit {
-    /// Bot side exited (e.g. Telegram `PollingExit::Fatal` against the
-    /// local proxy, or a future graceful-shutdown path). The backend
-    /// listener is aborted by `run_bridge` before this returns.
-    Graceful,
-    /// Backend listener died (token revoked, persistent gateway
-    /// disconnect, panic) or initialization failed. The local proxy
-    /// task is aborted before this returns. The caller is expected to
-    /// surface this as a non-zero process exit at the outermost scope
-    /// it knows is safe — i.e. only after no other in-process bot is
-    /// still serving traffic.
-    Fatal,
-}
-
 // ============================================================
 // MessengerBackend trait
 // ============================================================
@@ -122,18 +103,8 @@ pub trait MessengerBackend: Send + Sync {
     async fn init(&mut self) -> Result<BotInfo, String>;
 
     /// Start listening for incoming messages, sending them through `tx`.
-    ///
-    /// Implementations spawn a long-lived background task and return its
-    /// `JoinHandle<()>` immediately. The handle resolves only when the
-    /// backend's listener dies — gateway disconnect with no recovery,
-    /// token revocation, or internal panic. `run_bridge` watches the
-    /// handle alongside `run_bot` and exits cokacdir with a clear error
-    /// when it completes, so a silently-dead backend (proxy still up,
-    /// no messages flowing) cannot masquerade as a healthy bot.
-    async fn start(
-        &self,
-        tx: mpsc::Sender<IncomingMessage>,
-    ) -> Result<tokio::task::JoinHandle<()>, String>;
+    /// This should spawn a background task and return immediately.
+    async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<(), String>;
 
     /// Send a text message to a chat
     async fn send_message(
@@ -548,7 +519,7 @@ async fn route_request(state: &ProxyState, req: &HttpRequest) -> Vec<u8> {
         if parts.len() >= 4 {
             // Verify token: "bot<token>" → strip "bot" prefix
             let token = parts[2].strip_prefix("bot").unwrap_or("");
-            if !tokens_eq_constant_time(token, &state.expected_token) {
+            if token != state.expected_token {
                 return http_json_response(401, unauthorized.to_string().as_bytes());
             }
             return handle_file_download(state, parts[3]).await;
@@ -561,7 +532,7 @@ async fn route_request(state: &ProxyState, req: &HttpRequest) -> Vec<u8> {
     let (token, method) = extract_token_and_method(path);
 
     // Verify token
-    if !tokens_eq_constant_time(token, &state.expected_token) {
+    if token != state.expected_token {
         return http_json_response(401, unauthorized.to_string().as_bytes());
     }
 
@@ -954,13 +925,10 @@ impl MessengerBackend for ConsoleBackend {
         })
     }
 
-    async fn start(
-        &self,
-        tx: mpsc::Sender<IncomingMessage>,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<(), String> {
         let counter = self.msg_id_counter.clone();
 
-        let handle = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
             let stdin = std::io::stdin();
             let reader = stdin.lock();
@@ -997,9 +965,7 @@ impl MessengerBackend for ConsoleBackend {
             }
         });
 
-        // `spawn_blocking` returns `JoinHandle<()>` directly — same shape
-        // as `spawn`, no map needed.
-        Ok(handle)
+        Ok(())
     }
 
     async fn send_message(
@@ -1481,10 +1447,7 @@ impl MessengerBackend for DiscordBackend {
         })
     }
 
-    async fn start(
-        &self,
-        tx: mpsc::Sender<IncomingMessage>,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<(), String> {
         let handler = DiscordHandler {
             tx,
             state: self.state.clone(),
@@ -1499,16 +1462,13 @@ impl MessengerBackend for DiscordBackend {
             .await
             .map_err(|e| format!("Discord client error: {}", e))?;
 
-        // serenity reconnects internally on transient gateway errors; this
-        // handle resolves only when reconnection has been given up (token
-        // revoked, banned, persistent network failure, panic).
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = client.start().await {
                 eprintln!("  ✗ Discord gateway error: {}", e);
             }
         });
 
-        Ok(handle)
+        Ok(())
     }
 
     async fn send_message(
@@ -1662,13 +1622,7 @@ impl MessengerBackend for DiscordBackend {
     }
 
     async fn get_file_data(&self, file_path: &str) -> Result<Vec<u8>, String> {
-        // file_path is supposed to be a Discord CDN URL stored by store_file.
-        // The proxy receives `file_path` from an HTTP path component, so an
-        // attacker who can reach the bridge port could otherwise have us
-        // fetch arbitrary URLs (SSRF). Restrict to Discord CDN hosts.
-        if !is_allowed_discord_file_url(file_path) {
-            return Err(format!("Refused to fetch non-Discord URL: {}", file_path));
-        }
+        // file_path is a Discord CDN URL stored by store_file
         let resp = reqwest::get(file_path)
             .await
             .map_err(|e| format!("Download failed: {}", e))?;
@@ -1678,47 +1632,6 @@ impl MessengerBackend for DiscordBackend {
             .map_err(|e| format!("Read failed: {}", e))?;
         Ok(bytes.to_vec())
     }
-}
-
-/// Constant-time byte comparison for authentication tokens.
-/// Always inspects every byte of both inputs so that an attacker cannot
-/// learn the prefix of the expected token from response timing.
-fn tokens_eq_constant_time(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        // Still consume one full pass over `a` to discourage length-leak via timing.
-        let mut acc: u8 = 0;
-        for &x in a {
-            acc |= x;
-        }
-        let _ = std::hint::black_box(acc);
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
-
-fn is_allowed_discord_file_url(url: &str) -> bool {
-    // Accept only HTTPS Discord-controlled CDN hosts. Matching the host on a
-    // segment boundary prevents tricks like `https://cdn.discordapp.com.evil/`.
-    const ALLOWED_HOSTS: &[&str] = &[
-        "cdn.discordapp.com",
-        "media.discordapp.net",
-    ];
-    let rest = match url.strip_prefix("https://") {
-        Some(r) => r,
-        None => return false,
-    };
-    // The host portion ends at the first '/', '?', or '#' — without including
-    // '?' and '#' a query-only or fragment-only URL would smuggle them into
-    // the host slice and the eq comparison would fail open or false-negative.
-    let host_end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
-    let host = &rest[..host_end];
-    ALLOWED_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
 }
 
 /// Split text into Discord-compatible chunks (max 2000 chars each).
@@ -2576,10 +2489,7 @@ impl MessengerBackend for SlackBackend {
         })
     }
 
-    async fn start(
-        &self,
-        tx: mpsc::Sender<IncomingMessage>,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> Result<(), String> {
         let client = self
             .client
             .as_ref()
@@ -2620,14 +2530,11 @@ impl MessengerBackend for SlackBackend {
             .await
             .map_err(|e| format!("Slack listen_for: {}", e))?;
 
-        // `serve()` runs the Socket Mode loop forever; it returns only on
-        // persistent failure (auth revoked, repeated reconnect failure)
-        // or panic. The handle resolution is the death signal.
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             listener.serve().await;
         });
 
-        Ok(handle)
+        Ok(())
     }
 
     async fn send_message(
@@ -2940,13 +2847,6 @@ impl MessengerBackend for SlackBackend {
     }
 
     async fn get_file_data(&self, file_path: &str) -> Result<Vec<u8>, String> {
-        // The Authorization header below carries the Slack bot token.
-        // file_path arrives via an HTTP path component, so without a host
-        // check we'd happily ship the bot token to any attacker-controlled
-        // URL. Restrict to Slack-owned hosts.
-        if !is_allowed_slack_file_url(file_path) {
-            return Err(format!("Refused to fetch non-Slack URL: {}", file_path));
-        }
         let auth = format!("Bearer {}", self.bot_token);
         let resp = reqwest::Client::new()
             .get(file_path)
@@ -2963,20 +2863,6 @@ impl MessengerBackend for SlackBackend {
             .map_err(|e| format!("Slack file read: {}", e))?;
         Ok(bytes.to_vec())
     }
-}
-
-fn is_allowed_slack_file_url(url: &str) -> bool {
-    let rest = match url.strip_prefix("https://") {
-        Some(r) => r,
-        None => return false,
-    };
-    // Host ends at '/', '?', or '#' — see is_allowed_discord_file_url for why.
-    let host_end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
-    let host = &rest[..host_end].to_ascii_lowercase();
-    // Slack file URLs are served from files.slack.com; allow subdomains of
-    // slack.com only on a path-segment boundary so "files.slack.com.evil"
-    // does not match.
-    host == "files.slack.com" || host == "slack.com" || host.ends_with(".slack.com")
 }
 
 /// Process a Slack push event from the Socket Mode listener.
@@ -3319,7 +3205,7 @@ async fn process_slack_app_mention_event(
 ///
 /// `backend_name`: "console", "discord", "slack", etc.
 /// `args`: backend-specific arguments
-pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
+pub async fn run_bridge(backend_name: &str, args: &[String]) {
     let mut backend: Box<dyn MessengerBackend> = match backend_name {
         "console" => Box::new(ConsoleBackend::new()),
         "discord" => {
@@ -3328,7 +3214,7 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
                 None => {
                     eprintln!("Error: Discord bridge requires a bot token");
                     eprintln!("Usage: cokacdir --ccserver <DISCORD_BOT_TOKEN>");
-                    return BridgeExit::Fatal;
+                    std::process::exit(1);
                 }
             };
             Box::new(DiscordBackend::new(token))
@@ -3337,7 +3223,7 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
             if args.len() < 2 {
                 eprintln!("Error: Slack bridge requires both bot token (xoxb-) and app-level token (xapp-)");
                 eprintln!("Usage: cokacdir --ccserver slack:<xoxb-...>,<xapp-...>");
-                return BridgeExit::Fatal;
+                std::process::exit(1);
             }
             Box::new(SlackBackend::new(args[0].clone(), args[1].clone()))
         }
@@ -3346,7 +3232,7 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
                 "Error: Unknown messenger backend '{}'. Supported: console, discord, slack",
                 other
             );
-            return BridgeExit::Fatal;
+            std::process::exit(1);
         }
     };
 
@@ -3358,35 +3244,23 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
         }
         Err(e) => {
             eprintln!("  ✗ Backend init failed: {}", e);
-            return BridgeExit::Fatal;
+            std::process::exit(1);
         }
     };
 
     // Message channel: backend → proxy → teloxide
     let (tx, rx) = mpsc::channel(256);
 
-    // Start backend listener — the returned `JoinHandle` resolves only when
-    // the backend's gateway listener dies (token revoked, persistent
-    // disconnect, panic). We watch it alongside `run_bot` below so a dead
-    // backend cannot silently masquerade as a healthy bot (proxy still up,
-    // no messages flowing) — the same failure-class as Telegram 401/409,
-    // which `polling_loop` already detects and surfaces.
+    // Start backend listener
     let backend_arc: Arc<dyn MessengerBackend> = Arc::from(backend);
-    let backend_handle = match backend_arc.start(tx).await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("  ✗ Backend listener init failed: {}", e);
-            return BridgeExit::Fatal;
-        }
-    };
-    // Independent aborter so we can stop the listener even after the
-    // `JoinHandle` is moved into `tokio::select!` below — `select!`
-    // drops the un-selected branch's future, but dropping a tokio
-    // `JoinHandle` does NOT abort the underlying task. Without an
-    // explicit abort the gateway listener would leak in multi-bot
-    // setups when a sibling bot's bridge exits first (process::exit
-    // used to mask this leak by tearing down the runtime).
-    let backend_aborter = backend_handle.abort_handle();
+    {
+        let backend_clone = backend_arc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = backend_clone.start(tx).await {
+                eprintln!("  ✗ Backend listener error: {}", e);
+            }
+        });
+    }
 
     // Generate a stable bridge token for telegram.rs settings storage.
     // Hash the real token to avoid exposing it in URL paths and debug logs.
@@ -3410,72 +3284,17 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
         Ok(l) => l,
         Err(e) => {
             eprintln!("  ✗ Failed to bind proxy server: {}", e);
-            // Best-effort abort of the already-spawned backend listener
-            // so a multi-bot run doesn't leak it on this early-error
-            // path. (No-op if it has already exited.)
-            backend_aborter.abort();
-            return BridgeExit::Fatal;
+            std::process::exit(1);
         }
     };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let api_url = format!("http://127.0.0.1:{}", port);
     println!("  ✓ Proxy: {}", api_url);
 
-    // Start proxy server. Held as a `JoinHandle` rather than detached so
-    // we can abort it on bridge exit — otherwise the listener would
-    // keep its TCP port bound (causing port collisions on bot restart)
-    // and outlive its own bot in multi-bot setups.
+    // Start proxy server
     let proxy_state = state.clone();
-    let proxy_handle = tokio::spawn(run_proxy_server(proxy_state, listener));
+    tokio::spawn(run_proxy_server(proxy_state, listener));
 
-    // Run the existing telegram bot logic — it connects to our proxy.
-    // Race the backend handle so a backend death (gateway disconnect with
-    // no recovery, token revocation, panic) is surfaced as
-    // `BridgeExit::Fatal` instead of leaving a vegetative proxy +
-    // teloxide pair that silently never delivers messages. The actual
-    // process-exit decision is deferred to `main` so a sibling bot in
-    // a multi-bot run is not killed by one backend's death.
-    let exit = tokio::select! {
-        bot_exit = crate::services::telegram::run_bot(&bridge_token, Some(&api_url)) => {
-            // Bot exited. Forward `BotExit::Fatal` (revoked token,
-            // persistent `Conflict`) as `BridgeExit::Fatal` so the
-            // outermost caller surfaces a non-zero process exit and the
-            // supervisor restarts us — without this mapping, run_bot's
-            // fatal signal is silently lost on the bridge path and the
-            // bot stays dead with exit code 0. `backend_handle` is
-            // dropped by the select but that does NOT abort the
-            // underlying task — the explicit `backend_aborter.abort()`
-            // below does.
-            match bot_exit {
-                crate::services::telegram::BotExit::Fatal => BridgeExit::Fatal,
-                crate::services::telegram::BotExit::Graceful => BridgeExit::Graceful,
-            }
-        }
-        res = backend_handle => {
-            eprintln!("  ✗ Backend listener stopped — bot can no longer receive messages.");
-            match res {
-                Ok(()) => eprintln!(
-                    "    Reason: backend listener exited (token revoked, persistent gateway disconnect, or remote shutdown)."
-                ),
-                Err(join_err) if join_err.is_panic() => eprintln!(
-                    "    Reason: backend task PANICKED: {}", join_err
-                ),
-                Err(join_err) => eprintln!(
-                    "    Reason: backend task error: {}", join_err
-                ),
-            }
-            eprintln!("    Fix the underlying issue and restart cokacdir.");
-            BridgeExit::Fatal
-        }
-    };
-
-    // Cleanup: abort the listener and proxy server before returning so
-    // they don't leak in a multi-bot deployment where the runtime keeps
-    // running for sibling bots. Aborting an already-completed task is a
-    // no-op, so calling on the Fatal arm (where `backend_handle` already
-    // resolved) is safe.
-    backend_aborter.abort();
-    proxy_handle.abort();
-
-    exit
+    // Run the existing telegram bot logic — it connects to our proxy
+    crate::services::telegram::run_bot(&bridge_token, Some(&api_url)).await;
 }

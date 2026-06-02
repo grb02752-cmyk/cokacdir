@@ -1,11 +1,11 @@
+use crate::keybindings::KeybindingsConfig;
+use crate::services::remote::RemoteProfile;
+use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
-use crate::services::remote::RemoteProfile;
-use crate::keybindings::KeybindingsConfig;
 
 use crate::utils::format::strip_unc_prefix;
 
@@ -38,6 +38,25 @@ fn default_encrypt_split_size() -> u64 {
 
 fn default_telegram_polling_time() -> u64 {
     3000
+}
+
+/// Environment variable that overrides the default ~/.cokacdir state root.
+pub const STATE_ROOT_ENV_VAR: &str = "COKACDIR_STATE_ROOT";
+
+/// Returns the effective state root directory.
+///
+/// Resolution order:
+/// 1. `COKACDIR_STATE_ROOT`
+/// 2. `~/.cokacdir`
+pub fn state_root_dir() -> Option<PathBuf> {
+    std::env::var_os(STATE_ROOT_ENV_VAR)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cokacdir")))
+}
+
+fn default_telegram_api_min_gap_ms() -> u64 {
+    0
 }
 
 impl Default for PanelSettings {
@@ -103,9 +122,12 @@ pub struct Settings {
     /// Encryption split size in MB (0 = no split)
     #[serde(default = "default_encrypt_split_size")]
     pub encrypt_split_size: u64,
-    /// Telegram API polling interval in milliseconds (minimum 2500, default 3000)
+    /// Telegram stream/poll loop interval in milliseconds (default 3000)
     #[serde(default = "default_telegram_polling_time")]
     pub telegram_polling_time: u64,
+    /// Telegram per-chat API minimum gap in milliseconds (0 = follow polling cadence)
+    #[serde(default = "default_telegram_api_min_gap_ms")]
+    pub telegram_api_min_gap_ms: u64,
 }
 
 impl Default for Settings {
@@ -175,14 +197,15 @@ impl Default for Settings {
             keybindings: KeybindingsConfig::default(),
             encrypt_split_size: default_encrypt_split_size(),
             telegram_polling_time: default_telegram_polling_time(),
+            telegram_api_min_gap_ms: default_telegram_api_min_gap_ms(),
         }
     }
 }
 
 impl Settings {
-    /// Returns the config directory path (~/.cokacdir)
+    /// Returns the config directory path (COKACDIR_STATE_ROOT or ~/.cokacdir)
     pub fn config_dir() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".cokacdir"))
+        state_root_dir()
     }
 
     /// Returns the themes directory path (~/.cokacdir/themes)
@@ -258,14 +281,13 @@ impl Settings {
         // Ensure config directories and files exist
         Self::ensure_config_exists();
 
-        let config_path = Self::config_path()
-            .ok_or_else(|| "Could not determine config path".to_string())?;
+        let config_path =
+            Self::config_path().ok_or_else(|| "Could not determine config path".to_string())?;
 
         let content = fs::read_to_string(&config_path)
             .map_err(|e| format!("Failed to read settings file: {}", e))?;
 
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Invalid JSON in settings.json: {}", e))
+        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON in settings.json: {}", e))
     }
 
     /// Saves settings to the config file using atomic write pattern
@@ -361,6 +383,29 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn state_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_state_root_env<T>(value: Option<&Path>, f: impl FnOnce() -> T) -> T {
+        let _guard = state_root_env_lock().lock().unwrap();
+        let previous = std::env::var_os(STATE_ROOT_ENV_VAR);
+        match value {
+            Some(path) => std::env::set_var(STATE_ROOT_ENV_VAR, path),
+            None => std::env::remove_var(STATE_ROOT_ENV_VAR),
+        }
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var(STATE_ROOT_ENV_VAR, value),
+            None => std::env::remove_var(STATE_ROOT_ENV_VAR),
+        }
+        result
+    }
 
     #[test]
     fn test_default_settings() {
@@ -375,7 +420,10 @@ mod tests {
     #[test]
     fn test_parse_partial_json() {
         let test_path = std::env::temp_dir().display().to_string();
-        let json = format!(r#"{{"panels":[{{"start_path":"{}"}}]}}"#, test_path.replace('\\', "\\\\"));
+        let json = format!(
+            r#"{{"panels":[{{"start_path":"{}"}}]}}"#,
+            test_path.replace('\\', "\\\\")
+        );
         let settings: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings.panels[0].start_path, Some(test_path));
         assert_eq!(settings.panels[0].sort_by, "name");
@@ -397,5 +445,37 @@ mod tests {
         assert!(json.contains("\"name\": \"light\""));
         assert!(json.contains("\"palette\""));
         assert!(json.contains("\"panel\""));
+    }
+
+    #[test]
+    fn test_state_root_dir_prefers_env_override() {
+        let dir = tempdir().unwrap();
+        let expected = dir.path().join("isolated-cokacdir");
+        with_state_root_env(Some(&expected), || {
+            assert_eq!(state_root_dir(), Some(expected.clone()));
+            assert_eq!(Settings::config_dir(), Some(expected.clone()));
+        });
+    }
+
+    #[test]
+    fn test_ensure_config_exists_uses_env_override() {
+        let dir = tempdir().unwrap();
+        let state_root = dir.path().join("state-root");
+        with_state_root_env(Some(&state_root), || {
+            Settings::ensure_config_exists();
+            assert!(state_root.is_dir(), "state root should exist");
+            assert!(
+                state_root.join("themes").is_dir(),
+                "themes directory should exist"
+            );
+            assert!(
+                state_root.join("themes").join("light.json").exists(),
+                "light.json should exist"
+            );
+            assert!(
+                state_root.join("settings.json").exists(),
+                "settings.json should exist"
+            );
+        });
     }
 }
