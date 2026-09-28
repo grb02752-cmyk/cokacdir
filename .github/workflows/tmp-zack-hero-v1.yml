@@ -1,0 +1,93 @@
+name: temp zack hero v1 render
+on:
+  push:
+    branches:
+      - tmp/zack-hero-v1-20260929
+permissions:
+  contents: read
+
+jobs:
+  render:
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk:
+          - { start: 1, end: 15, id: "001-015" }
+          - { start: 16, end: 30, id: "016-030" }
+          - { start: 31, end: 45, id: "031-045" }
+          - { start: 46, end: 60, id: "046-060" }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1 libegl1 libx11-6 libxi6 libxrender1 libxfixes3 libxkbcommon0 libxcb1
+      - name: Download Blender
+        run: |
+          curl -L --retry 3 https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz -o blender.tar.xz
+          tar -xf blender.tar.xz
+      - name: Render hero chunk
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          START_FRAME: ${{ matrix.chunk.start }}
+          END_FRAME: ${{ matrix.chunk.end }}
+        run: |
+          mkdir -p hero_out
+          xvfb-run -a ./blender-5.2.2-linux-x64/blender -b -P tmp/blender_zack_hero_v1.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hero-frames-${{ matrix.chunk.id }}
+          path: hero_out/frames/frame_*.png
+          retention-days: 3
+          compression-level: 0
+      - name: Upload blend once
+        if: matrix.chunk.start == 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: zack-hero-v1-blend
+          path: hero_out/zack_hero_v1.blend
+          retention-days: 3
+          compression-level: 0
+
+  encode:
+    needs: render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hero-frames-*
+          path: frames
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: zack-hero-v1-blend
+          path: blend
+      - name: Encode and verify
+        run: |
+          COUNT="$(find frames -maxdepth 1 -name 'frame_*.png' | wc -l)"
+          echo "FRAME_COUNT=$COUNT"
+          test "$COUNT" -eq 60
+          ffmpeg -y -framerate 30 -i frames/frame_%04d.png -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p -movflags +faststart zack_hero_v1_2s_30fps.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration,codec_name,nb_frames -of default=nw=1 zack_hero_v1_2s_30fps.mp4
+          cp frames/frame_0012.png preview_0012.png
+          cp frames/frame_0032.png preview_0032.png
+          cp frames/frame_0055.png preview_0055.png
+          cp blend/zack_hero_v1.blend zack_hero_v1.blend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zack-hero-v1-final
+          path: |
+            zack_hero_v1_2s_30fps.mp4
+            zack_hero_v1.blend
+            preview_0012.png
+            preview_0032.png
+            preview_0055.png
+          retention-days: 3
+          compression-level: 0
