@@ -276,7 +276,9 @@ def setup_result(f):
 # Save a reusable .blend before rendering
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, "zack_stapler_v3.blend"))
 
-for f in range(1,151):
+start_frame = int(os.environ.get("START_FRAME", "1"))
+end_frame = int(os.environ.get("END_FRAME", "150"))
+for f in range(start_frame, end_frame+1):
     scene.frame_set(f)
     if f <= 36:
         show_only(0)
@@ -290,7 +292,7 @@ for f in range(1,151):
     bpy.context.view_layer.update()
     scene.render.filepath = os.path.join(FRAMES, f"frame_{f:04d}.png")
     bpy.ops.render.render(write_still=True)
-    print(f"RENDERED {f}/150", flush=True)
+    print(f"RENDERED {f}/{end_frame} chunk={start_frame}-{end_frame}", flush=True)
 
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, "zack_stapler_v3.blend"))
 print("DONE", flush=True)
