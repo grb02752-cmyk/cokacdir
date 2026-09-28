@@ -1,0 +1,117 @@
+name: temp correct and encode zack v3
+on:
+  push:
+    branches:
+      - tmp/blender-zack-v3-20260928
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rerender:
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk:
+          - { start: 97, end: 120, id: "097-120" }
+          - { start: 121, end: 150, id: "121-150" }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1 libegl1 libx11-6 libxi6 libxrender1 libxfixes3 libxkbcommon0 libxcb1
+      - run: |
+          curl -L --retry 3 https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz -o blender.tar.xz
+          tar -xf blender.tar.xz
+      - name: Rerender corrected chunk
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          START_FRAME: ${{ matrix.chunk.start }}
+          END_FRAME: ${{ matrix.chunk.end }}
+        run: |
+          mkdir -p render_out
+          xvfb-run -a ./blender-5.2.2-linux-x64/blender -b -P tmp/blender_zack_v3.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corrected-${{ matrix.chunk.id }}
+          path: render_out/frames/frame_*.png
+          retention-days: 3
+          compression-level: 0
+      - name: Upload corrected blend once
+        if: matrix.chunk.start == 97
+        uses: actions/upload-artifact@v4
+        with:
+          name: corrected-blend
+          path: render_out/zack_stapler_v3.blend
+          retention-days: 3
+          compression-level: 0
+
+  encode:
+    needs: rerender
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Download original frames 1-30
+        uses: actions/download-artifact@v4
+        with:
+          name: frames-001-030
+          path: frames
+          run-id: 36495418695
+          github-token: ${{ github.token }}
+      - name: Download original frames 31-60
+        uses: actions/download-artifact@v4
+        with:
+          name: frames-031-060
+          path: frames
+          run-id: 36495418695
+          github-token: ${{ github.token }}
+      - name: Download original frames 61-90
+        uses: actions/download-artifact@v4
+        with:
+          name: frames-061-090
+          path: frames
+          run-id: 36495418695
+          github-token: ${{ github.token }}
+      - name: Download original frames 91-120
+        uses: actions/download-artifact@v4
+        with:
+          name: frames-091-120
+          path: frames
+          run-id: 36495418695
+          github-token: ${{ github.token }}
+      - name: Overlay corrected frames
+        uses: actions/download-artifact@v4
+        with:
+          pattern: corrected-*
+          path: corrected-download
+      - name: Merge corrected frames and encode
+        run: |
+          find corrected-download -type f -name 'frame_*.png' -exec cp -f {} frames/ \;
+          COUNT="$(find frames -maxdepth 1 -name 'frame_*.png' | wc -l)"
+          echo "FRAME_COUNT=$COUNT"
+          test "$COUNT" -eq 150
+          ffmpeg -y -framerate 30 -i frames/frame_%04d.png -c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart zack_stapler_v3_fixed_5s_30fps.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration,codec_name,nb_frames -of default=nw=1 zack_stapler_v3_fixed_5s_30fps.mp4
+          cp frames/frame_0020.png preview_0020.png
+          cp frames/frame_0068.png preview_0068.png
+          cp frames/frame_0128.png preview_0128.png
+          BLEND="$(find corrected-download -type f -name 'zack_stapler_v3.blend' | head -n 1)"
+          test -n "$BLEND"
+          cp "$BLEND" zack_stapler_v3_fixed.blend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zack-stapler-v3-fixed-final
+          path: |
+            zack_stapler_v3_fixed_5s_30fps.mp4
+            zack_stapler_v3_fixed.blend
+            preview_0020.png
+            preview_0068.png
+            preview_0128.png
+          retention-days: 3
+          compression-level: 0
