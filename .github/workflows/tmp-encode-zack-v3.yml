@@ -1,8 +1,6 @@
 name: temp encode zack v3 existing frames
 on:
-  push:
-    branches:
-      - tmp/blender-zack-v3-20260928
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
