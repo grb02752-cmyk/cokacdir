@@ -1,8 +1,6 @@
 name: temp preview zack v3 final shot
 on:
-  push:
-    branches:
-      - tmp/blender-zack-v3-20260928
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
