@@ -5,10 +5,20 @@ on:
       - tmp/blender-zack-v3-20260928
 permissions:
   contents: read
+
 jobs:
   render:
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk:
+          - { start: 1, end: 30, id: "001-030" }
+          - { start: 31, end: 60, id: "031-060" }
+          - { start: 61, end: 90, id: "061-090" }
+          - { start: 91, end: 120, id: "091-120" }
+          - { start: 121, end: 150, id: "121-150" }
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install runtime
@@ -19,27 +29,54 @@ jobs:
         run: |
           curl -L --retry 3 https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz -o blender.tar.xz
           tar -xf blender.tar.xz
-      - name: Render 150 native frames
+      - name: Render chunk
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
+          START_FRAME: ${{ matrix.chunk.start }}
+          END_FRAME: ${{ matrix.chunk.end }}
         run: |
           mkdir -p render_out
           xvfb-run -a ./blender-5.2.2-linux-x64/blender -b -P tmp/blender_zack_v3.py
-      - name: Encode H264
-        run: |
-          ffmpeg -y -framerate 30 -i render_out/frames/frame_%04d.png -c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart render_out/zack_stapler_v3_5s_30fps.mp4
-          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration,codec_name -of default=nw=1 render_out/zack_stapler_v3_5s_30fps.mp4
-          cp render_out/frames/frame_0020.png render_out/preview_0020.png
-          cp render_out/frames/frame_0068.png render_out/preview_0068.png
-          cp render_out/frames/frame_0128.png render_out/preview_0128.png
       - uses: actions/upload-artifact@v4
         with:
-          name: zack-stapler-v3-render
+          name: frames-${{ matrix.chunk.id }}
+          path: render_out/frames/frame_*.png
+          retention-days: 3
+          compression-level: 0
+      - name: Upload blend once
+        if: matrix.chunk.start == 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: zack-stapler-v3-blend
+          path: render_out/zack_stapler_v3.blend
+          retention-days: 3
+          compression-level: 0
+
+  encode:
+    needs: render
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: frames-*
+          path: frames
+          merge-multiple: true
+      - name: Verify 150 frames and encode
+        run: |
+          test "$(find frames -maxdepth 1 -name 'frame_*.png' | wc -l)" -eq 150
+          ffmpeg -y -framerate 30 -i frames/frame_%04d.png -c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart zack_stapler_v3_5s_30fps.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration,codec_name,nb_frames -of default=nw=1 zack_stapler_v3_5s_30fps.mp4
+          cp frames/frame_0020.png preview_0020.png
+          cp frames/frame_0068.png preview_0068.png
+          cp frames/frame_0128.png preview_0128.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zack-stapler-v3-final
           path: |
-            render_out/zack_stapler_v3_5s_30fps.mp4
-            render_out/zack_stapler_v3.blend
-            render_out/preview_0020.png
-            render_out/preview_0068.png
-            render_out/preview_0128.png
+            zack_stapler_v3_5s_30fps.mp4
+            preview_0020.png
+            preview_0068.png
+            preview_0128.png
           retention-days: 3
           compression-level: 0
