@@ -242,6 +242,8 @@ def show_only(group_index):
             o.hide_viewport = not vis
 
 def setup_external(f):
+    floor.hide_render = False
+    floor.hide_viewport = False
     t = ease((f-1)/35.0)
     top_root.rotation_euler = (0, math.radians(lerp(-12.0, 0.0, t)), 0)
     hand_root.location.z = lerp(0.18, -0.20, t)
@@ -252,6 +254,8 @@ def setup_external(f):
     look_at(cam, (0.45,0,0.92))
 
 def setup_cross(f):
+    floor.hide_render = False
+    floor.hide_viewport = False
     t = (f-37)/59.0
     drop = ease(min(1.0, t/0.68))
     bend = ease(max(0.0, (t-0.62)/0.38))
@@ -263,6 +267,8 @@ def setup_cross(f):
     look_at(cam, (0,0,lerp(0.50,0.05,t)))
 
 def setup_result(f):
+    floor.hide_render = True
+    floor.hide_viewport = True
     t = (f-97)/53.0
     bend = ease(min(1.0, t/0.56))
     reveal = ease(max(0.0, (t-0.46)/0.54))
@@ -278,7 +284,9 @@ bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, "zack_stapler_v3.blend"))
 
 start_frame = int(os.environ.get("START_FRAME", "1"))
 end_frame = int(os.environ.get("END_FRAME", "150"))
-for f in range(start_frame, end_frame+1):
+frame_list_env = os.environ.get("FRAME_LIST", "").strip()
+frames_to_render = [int(x) for x in frame_list_env.split(",") if x.strip()] if frame_list_env else list(range(start_frame, end_frame+1))
+for f in frames_to_render:
     scene.frame_set(f)
     if f <= 36:
         show_only(0)
