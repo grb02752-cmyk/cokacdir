@@ -1,8 +1,6 @@
 name: temp blender zack v3 render
 on:
-  push:
-    branches:
-      - tmp/blender-zack-v3-20260928
+  workflow_dispatch:
 permissions:
   contents: read
 
