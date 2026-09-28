@@ -1,0 +1,32 @@
+name: temp preview zack v3 final shot
+on:
+  push:
+    branches:
+      - tmp/blender-zack-v3-20260928
+permissions:
+  contents: read
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1 libegl1 libx11-6 libxi6 libxrender1 libxfixes3 libxkbcommon0 libxcb1
+      - run: |
+          curl -L --retry 3 https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz -o blender.tar.xz
+          tar -xf blender.tar.xz
+      - name: Render corrected sample frames
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          FRAME_LIST: "97,128,150"
+        run: |
+          mkdir -p render_out
+          xvfb-run -a ./blender-5.2.2-linux-x64/blender -b -P tmp/blender_zack_v3.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corrected-preview
+          path: render_out/frames/*.png
+          retention-days: 3
+          compression-level: 0
